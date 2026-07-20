@@ -1,0 +1,72 @@
+version: "3.9"
+
+services:
+  api:
+    build: .
+    container_name: ampops-api
+    env_file: .env
+    ports:
+      - "8000:8000"
+    depends_on:
+      - redis
+      - mlflow
+    volumes:
+      - ./app:/app/app
+
+  redis:
+    image: redis:7-alpine
+    container_name: ampops-redis
+    ports:
+      - "6379:6379"
+    volumes:
+      - redis-data:/data
+
+  mlflow:
+    image: ghcr.io/mlflow/mlflow:latest
+    container_name: ampops-mlflow
+    ports:
+      - "5000:5000"
+    command: >
+      mlflow server
+      --host 0.0.0.0
+      --port 5000
+      --backend-store-uri sqlite:///mlflow.db
+      --default-artifact-root /mlartifacts
+    volumes:
+      - mlflow-data:/mlartifacts
+
+  postgres:
+    image: postgres:15
+    container_name: ampops-postgres
+    environment:
+      POSTGRES_USER: airflow
+      POSTGRES_PASSWORD: airflow
+      POSTGRES_DB: airflow
+    volumes:
+      - postgres-data:/var/lib/postgresql/data
+
+  prometheus:
+    image: prom/prometheus:latest
+    container_name: ampops-prometheus
+    ports:
+      - "9090:9090"
+    volumes:
+      - ./monitoring/prometheus.yml:/etc/prometheus/prometheus.yml
+    depends_on:
+      - api
+
+  grafana:
+    image: grafana/grafana:latest
+    container_name: ampops-grafana
+    ports:
+      - "3000:3000"
+    volumes:
+      - grafana-data:/var/lib/grafana
+    depends_on:
+      - prometheus
+
+volumes:
+  redis-data:
+  mlflow-data:
+  postgres-data:
+  grafana-data:

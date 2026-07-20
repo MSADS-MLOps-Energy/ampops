@@ -1,0 +1,39 @@
+# --- Core data & ML ---
+pandas
+numpy
+scikit-learn
+xgboost
+torch
+
+# --- Pipeline orchestration ---
+apache-airflow==2.9.3
+# prefect  # swap in if using Prefect instead of Airflow
+
+# --- Data versioning ---
+dvc
+dvc-s3  # or dvc-gs / dvc-azure depending on remote storage
+
+# --- Experiment tracking & registry ---
+mlflow
+
+# --- Serving ---
+fastapi
+uvicorn[standard]
+pydantic
+redis
+
+# --- Weather / external data ---
+requests
+openmeteo-requests
+requests-cache
+retry-requests
+
+# --- Monitoring ---
+prometheus-client
+prometheus-fastapi-instrumentator
+
+# --- Dev tooling ---
+ruff
+pytest
+pytest-cov
+python-dotenv
