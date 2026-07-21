@@ -12,15 +12,6 @@ Modern electric grids operate under strict frequency balance requirements, and s
 
 AmpOps automates the end-to-end machine learning lifecycle for short-term load forecasting: it ingests raw smart meter and weather telemetry, versions feature data, tracks challenger models, deploys low-latency containerized inference, and continuously monitors for sensor failure or data drift.
 
-## Team
-
-| Role | Owner | Responsibilities |
-|---|---|---|
-| Data & Orchestration Lead | Sachin Patel | Data ingestion, DVC tracking, feature engineering, Airflow/Prefect DAGs |
-| Model Infrastructure Lead | Minhae Park | Baseline vs. deep learning models, hyperparameter tuning, MLflow tracking/registry |
-| Deployment Engineer | Miguel Roca Garcia | Docker packaging, FastAPI endpoint, SLA testing, shadow/canary routing |
-| Monitoring & Reliability Lead | Collin Kim | Prometheus/Grafana, drift simulation, continuous training webhook |
-
 ## Data Sources
 
 - **[PJM Hourly Energy Consumption](https://www.kaggle.com/datasets/robikscube/hourly-energy-consumption)** — 10+ years of hourly electricity consumption (MW) across major US regional transmission grids.
