@@ -21,22 +21,30 @@ AmpOps is a weather-coupled electricity demand forecasting pipeline, built as th
 | Dataset | Contents | Coverage | Status |
 |---|---|---|---|
 | Open-Meteo weather export | Hourly weather (temp, humidity, dew point, wind, pressure, cloud cover, soil temp/moisture, etc.) for a Chicago-area point (41.86°N, −87.65°W, elev. 179m) | 2010-01-01 through 2019-12-31 | Uploaded, needs cleanup (see 2.2) |
-| Kaggle "Hourly Energy Consumption" — `COMED_hourly.csv` | Hourly load in MW for the ComEd (Commonwealth Edison, Chicago-area utility) balancing region | Approx. 2011–2018 (confirm exact start/end once loaded — PJM data has had regional gaps historically) | Identified, not yet joined |
+| Kaggle "Hourly Energy Consumption" — `COMED_hourly.csv` | Hourly load in MW for the ComEd (Commonwealth Edison, Chicago-area utility) balancing region | Confirmed: 2011-01-01 01:00 through 2018-08-03 00:00, 66,497 rows | Uploaded, needs cleanup (see 2.2) — this is the real training overlap window, not weather's full 2010–2019 range |
 
 The pairing is a good fit: ComEd's service territory is the Chicago metro area, so the weather station coordinates line up with the demand region.
 
-### 2.2 Known data quality issue — resolve before any pipeline work
+### 2.2 Known data quality issues — resolve before any pipeline work
+
+#### 2.2.1 Weather file is two concatenated exports
 The uploaded weather CSV is actually **two Open-Meteo exports concatenated in one file**:
 - Rows 1–87,653: hourly grain, 2010–2019
 - Row 87,654 onward: a **second header row**, then a daily-aggregated re-export of the *same* 2010–2019 period (mean/max/min temp, sunrise/sunset, daylight duration, etc.)
 
 **Decision made (recommended):** use the hourly grain only — it matches the hourly granularity of `COMED_hourly.csv` and the course's premise of hourly-coupled demand. Split the file into two clean CSVs on ingestion (or just slice at the header row) and treat the daily block as scrap, or optionally mine it later for daily-aggregate features (e.g., daily degree-days) if the team wants richer calendar features.
 
+#### 2.2.2 Timezone/DST mismatch between the two sources — the critical one
+The weather export's metadata row (`utc_offset_seconds=-18000`, `timezone_abbreviation=GMT-5`) confirms it is stamped on a **fixed UTC-5 offset that never shifts for daylight saving**. `COMED_hourly.csv`'s `Datetime` column, by contrast, is **local Chicago clock time that observes real US DST transitions**: it has 11 missing spring-forward hours (e.g. `2011-03-13 03:00`) and 4 duplicated fall-back hours, each with two different `COMED_MW` readings (e.g. `2014-11-02 02:00`) — and the exact pattern is inconsistent year to year.
+
+**Implication:** a naive string-match join on the timestamp columns will silently misalign the two datasets by an hour for roughly 7 months of every year (whenever Chicago is on daylight time). This must be resolved — by converting COMED's DST-aware local time onto the same fixed-offset grid the weather data uses — before any join, and the realignment must be validated with an hour-of-day sanity check afterward, not assumed correct.
+
 ### 2.3 Open decisions — data layer
 | Decision | Recommendation | Why |
 |---|---|---|
 | Target variable | `COMED_MW`, regression | Given directly by the dataset |
-| Overlap window | Trim both datasets to the intersection of their date ranges — **verify `COMED_hourly.csv`'s actual min/max datetime once downloaded**, don't assume 2011–2018 | Weather data (2010–2019) and demand data don't fully overlap; training on non-overlapping rows wastes data and risks silent misalignment |
+| Overlap window | Confirmed: trim both datasets to 2011-01-01–2018-08-03 (COMED's range) | Weather data (2010–2019) and demand data don't fully overlap; training on non-overlapping rows wastes data and risks silent misalignment |
+| Duplicate fall-back timestamps | Average the two COMED_MW readings at each of the 4 duplicated hours (recommended over keep-first) | Both readings are real data for an ambiguous clock hour; averaging is defensible and keeps the series continuous. |
 | Evaluation metric | **MAPE as the primary/headline metric**, RMSE as a secondary check | MAPE is scale-free and easy to justify to non-technical graders ("X% average error"); RMSE penalizes large misses (useful since demand spikes are the failure mode that matters operationally) |
 | Train/test split | **Time-based split, not random** — e.g., train on all but the final 2–3 months, test on the tail, consistent with the course's requirement that the test set stay isolated until production validation | Random splits leak future information into training for time series; a real demand-forecasting deployment only ever has the past to work with |
 | Feature engineering | Calendar features (hour-of-day, day-of-week, month, holiday flag), lag features (t-24h, t-168h), rolling means, and the weather features already present | Non-linear demand-weather coupling is explicitly the framing of this project — calendar effects (weekday/weekend, season) usually explain as much variance as weather alone in load forecasting |
@@ -109,12 +117,13 @@ Feed each scenario through the deployed API and capture what Evidently flags (or
 
 ## 8. Open Gaps — needs a decision before or during Week 1
 
-- [X] Exact overlap window between the two datasets (verify `COMED_hourly.csv` date range directly)
+- [X] Exact overlap window between the two datasets — confirmed: 2011-01-01 through 2018-08-03 (`COMED_hourly.csv`'s range)
 - [X] Role assignment across the 4 workstreams above (today's meeting)
 - [X] Confirm MAPE/RMSE as the metric pair, or substitute if the team prefers something else
 - [ ] Decide whether to keep any daily-aggregate weather features or discard that block entirely
 - [X] Confirm Prefect/MLflow/FastAPI/Evidently stack, or flag if anyone has a strong reason to deviate
 - [ ] Finalize the shared data contract (joined dataset schema + API request/response schema) before workstreams diverge
+- [ ] Confirm the DST-realignment approach (fixed-offset conversion) holds up under the hour-of-day sanity check once implemented.
 
 ## 9. Task Managmenent
 
