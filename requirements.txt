@@ -37,3 +37,10 @@ ruff
 pytest
 pytest-cov
 python-dotenv
+
+# --- EDA / notebooks ---
+matplotlib
+seaborn
+pyarrow
+jupyter
+ipykernel
