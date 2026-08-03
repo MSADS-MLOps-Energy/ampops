@@ -149,6 +149,7 @@ Deliverable:
 ### Week 3:
 * Docker Containerization & FastAPI Build **Sachin**
 * Model Monitoring - EvidentlyAI **Minhae**
+* Data Drift Work to Validate Monitoring Dashboard **Minhae**
 
 Deliverable: 
 1. Docker Container & FastAPI deployed 
