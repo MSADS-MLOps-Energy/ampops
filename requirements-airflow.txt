@@ -1,0 +1,29 @@
+# Extra packages layered onto the official apache/airflow image.
+#
+# Deliberately narrow: only what the DAG imports. The top-level
+# requirements.txt also carries torch, dvc-s3, jupyter, and fastapi — none of
+# which the pipeline needs, and torch alone would add gigabytes to this image.
+#
+# Airflow itself is NOT listed here; it comes from the base image, and pip
+# installing it again would risk a version conflict with the image's own pins.
+#
+# Pinning rule: the Dockerfile installs these under Airflow's official
+# constraints file, which already pins everything in Airflow's dependency tree.
+# Pinning those here too only creates conflicts (a pyarrow==15.0.2 pin fails
+# outright against the constraint's 16.1.0). So:
+#   - governed by constraints -> leave unpinned, let the constraint decide
+#   - not in constraints      -> pin here, for reproducible builds
+
+# Governed by the Airflow constraints file.
+pandas
+numpy
+pyarrow
+
+# Not in the constraints file — pinned for reproducibility.
+scikit-learn==1.4.2
+xgboost==2.0.3
+holidays==0.47
+# 2.16.2 is the floor that works here: Airflow 2.9.3's constraints pin
+# pyarrow==16.1.0, and every mlflow before 2.16 caps pyarrow<16. Keep this in
+# sync with the mlflow server image tag in docker-compose.yml.
+mlflow==2.16.2

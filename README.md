@@ -59,67 +59,165 @@ Upstream Raw Data Ingestion (PJM Grid + Open-Meteo Weather API)
 ## Getting Started
 
 ### Prerequisites
-- Python 3.11+
-- Docker & Docker Compose
-- An AWS S3 bucket (or other DVC-supported remote) for data versioning
+- Docker & Docker Compose (required — the pipeline runs in containers)
+- Python 3.11 (optional, for running tests and the data stages on the host)
 
-### Setup
+### Getting the data
+
+Datasets are not committed to git. Download both files into `data/raw/` before
+running the pipeline — the filenames matter, since `src/ampops/config.py`
+resolves them by name:
+
+| File | Source | Notes |
+|---|---|---|
+| `COMED_hourly.csv` | [Kaggle: Hourly Energy Consumption](https://www.kaggle.com/datasets/robikscube/hourly-energy-consumption) | Take `COMED_hourly.csv` from the archive. 66,497 rows, 2011-01-01 → 2018-08-03. |
+| `open-meteo-41.86N87.65W179m.csv` | [Open-Meteo Historical Weather API](https://open-meteo.com/en/docs/historical-weather-api) | Chicago point 41.86N, -87.65W. Hourly variables, 2010-01-01 → 2019-12-31. |
+
+The pipeline validates both on ingest, so a wrong file or truncated download
+fails at `validate_raw` with a specific message rather than silently producing a
+bad model.
+
+Everything under `data/interim/` and `data/processed/` is generated — never
+commit it, and never hand-edit it.
+
+### Reproducing the training pipeline
+
+The whole pipeline runs in Docker. From a fresh clone, with the two raw files in
+place:
 
 ```bash
 git clone https://github.com/<your-org>/ampops.git
 cd ampops
 
-# create env and install dependencies
-make setup
-
-# configure environment variables
-cp .env.example .env
-# fill in DVC remote, MLflow URI, etc.
-
-# initialize data versioning
-make dvc-init
+cp .env.example .env    # Airflow credentials, MLflow URI
+make airflow-up         # builds the image and starts postgres, MLflow, Airflow
 ```
 
-### Running locally
+First build takes a few minutes. When it finishes:
+
+| Service | URL | Credentials |
+|---|---|---|
+| Airflow UI | http://localhost:8080 | `admin` / `admin` |
+| MLflow UI | http://localhost:5050 | — |
+
+Open the Airflow UI, find **`ampops_training_pipeline`**, and trigger it with the
+▶ button. It runs:
+
+```
+ingest_raw → validate_raw → clean_and_join → validate_joined
+  → build_features → split_train_test
+  → train[linear | random_forest | xgboost]   (dynamically mapped)
+  → choose_champion → register
+```
+
+On success you'll have `data/processed/{joined_hourly,features,train,test}.parquet`
+on the host, three runs in MLflow, and `ampops-demand-forecaster` registered with
+the `@champion` alias.
+
+Or trigger the same run from the command line:
 
 ```bash
-# spin up API, Redis, MLflow, Postgres, Prometheus, Grafana
-make docker-up
-
-# or run the API alone, outside Docker
-make run-api
+make dag-trigger
 ```
 
-| Service | URL |
-|---|---|
-| FastAPI docs | http://localhost:8000/docs |
-| MLflow UI | http://localhost:5000 |
-| Prometheus | http://localhost:9090 |
-| Grafana | http://localhost:3000 |
+For DAG development there is also `make dag-test`, which runs the whole DAG in a
+single process. It stops the scheduler first, deliberately: `airflow dags test`
+writes into the same metadata database the scheduler polls, so a running
+scheduler races it and executes every task twice — visible only as duplicate
+MLflow runs, never as an error.
+
+Serving and dashboard services (FastAPI, Redis, Prometheus, Grafana) sit behind a
+compose profile because they depend on files the deployment and monitoring
+workstreams have not written yet:
+
+```bash
+make docker-up          # docker compose --profile serving up
+```
+
+### Running Airflow without Docker (fallback)
+
+The identical DAG runs in a local Python 3.11 venv — useful if Docker is
+unavailable or slow to pull base images:
+
+```bash
+make setup                  # venv + dependencies
+make setup-airflow-local    # Airflow 2.9.3 under the official constraints
+make mlflow-local           # in a second shell — tracking server on :5000
+make dag-test-local         # runs the full DAG in one process
+```
+
+### Running the data stages without Docker
+
+```bash
+make setup                     # Python 3.11 venv + dependencies
+make pipeline-local            # ingest → validate → join → features → split
+```
+
+This skips training (which needs the MLflow server) but regenerates every
+processed dataset, and is the quickest way to check a change to `src/ampops/`.
 
 ### Development
 
 ```bash
 make lint    # Ruff
-make test    # pytest with coverage
+make test    # pytest
 ```
 
 ## Project Structure
 
 ```
 ampops/
-├── app/                # FastAPI service
-├── dags/               # Airflow/Prefect DAGs
+├── dags/               # Airflow DAG (orchestration only, no business logic)
+├── src/ampops/         # the pipeline package
+│   ├── config.py       # paths, constants, model configs — single source of truth
+│   ├── data/           # ingest, clean (DST realignment), join, validate
+│   ├── features/       # calendar + lag feature engineering, chronological split
+│   ├── training/       # model bake-off, champion selection, registry promotion
+│   └── utils/          # parquet IO, logging
+├── scripts/            # run_pipeline_local.py
+├── notebooks/          # 01_join_and_eda.ipynb (EDA deliverable)
+├── tests/              # pytest: cleaning, features, split, gates, DAG structure
+├── app/                # FastAPI service (deployment workstream)
+├── monitoring/         # Prometheus/Grafana config (monitoring workstream)
 ├── data/
-│   ├── raw/            # DVC-tracked raw telemetry
-│   └── processed/      # DVC-tracked curated features
-├── monitoring/         # Prometheus/Grafana config
-├── tests/
+│   ├── raw/            # source CSVs
+│   ├── interim/        # per-stage intermediates
+│   └── processed/      # joined, features, train, test
+├── docker/airflow/     # Airflow image
 ├── docker-compose.yml
-├── Dockerfile
-├── requirements.txt
+├── requirements.txt · requirements-airflow.txt
 └── Makefile
 ```
+
+## Engineering Notes
+
+Two decisions in the pipeline are worth reading the code for:
+
+**DST realignment** (`src/ampops/data/clean.py`). The weather export is stamped
+at a fixed UTC-5 offset that never observes daylight saving; the COMED load
+series is DST-aware. Joining them on the raw timestamps misaligns the two
+sources by one hour for the whole summer — silently, with no error and no null.
+
+Establishing the *direction* of that offset took real work, and the first
+attempt got it backwards. The two datasets are one hour apart in summer and
+aligned in winter, so the correction shifts summer rows −1h. Two mechanisms
+explain this and both predict the same shift (PJM publishes every zone on
+Eastern time, and/or the stamps are hour-ending), so they need not be
+adjudicated. The evidence: summer load-vs-temperature coupling peaks at −1h
+(0.7925 vs 0.7497 uncorrected), and adopting the correction improved *every*
+model in the bake-off. Full write-up in `docs/timezone_alignment_finding.md`.
+
+`validate.check_dst_alignment` guards the transformation on every run by
+comparing hour-of-day load profiles against an uncorrected control. Worth
+knowing its limit: it proves the transformation ran as intended, not that the
+intent was right — the superseded interpretation passed its own version of the
+same check.
+
+**No-leakage feature engineering** (`src/ampops/features/build.py`). Forecasts
+are day-ahead, so no feature may reference load newer than `t-24`. That rules out
+a `t-1` lag and requires every rolling window to be horizon-shifted before it is
+computed. `tests/test_features.py` enforces this empirically: it perturbs the
+target inside the forbidden window and asserts no feature value moves.
 
 ## License
 
