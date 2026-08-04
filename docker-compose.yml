@@ -1,9 +1,144 @@
-version: "3.9"
+# AmpOps local stack.
+#
+# `docker compose up -d` brings up the training pipeline: postgres, mlflow, and
+# Airflow (init/scheduler/webserver).
+#
+# The serving and dashboard services (api, redis, prometheus, grafana) are
+# behind the "serving" profile because they depend on files the deployment and
+# monitoring workstreams have not written yet (app/main.py, monitoring/
+# prometheus.yml). Start them once those exist:
+#     docker compose --profile serving up -d
+
+x-airflow-common: &airflow-common
+  build:
+    context: .
+    dockerfile: docker/airflow/Dockerfile
+  environment: &airflow-common-env
+    AIRFLOW__CORE__EXECUTOR: LocalExecutor
+    AIRFLOW__DATABASE__SQL_ALCHEMY_CONN: postgresql+psycopg2://airflow:airflow@postgres/airflow
+    AIRFLOW__CORE__LOAD_EXAMPLES: "false"
+    AIRFLOW__CORE__DAGS_ARE_PAUSED_AT_CREATION: "false"
+    AIRFLOW__WEBSERVER__EXPOSE_CONFIG: "true"
+    # src-layout: this is what makes `import ampops` resolve inside the DAG.
+    PYTHONPATH: /opt/airflow/src
+    # Absolute paths so ampops.config resolves the same way in every container.
+    AMPOPS_DATA_DIR: /opt/airflow/data
+    MLFLOW_TRACKING_URI: http://mlflow:5000
+    MLFLOW_EXPERIMENT: ampops-demand-forecasting
+    # The Airflow image has no git binary, so MLflow cannot stamp a source Git
+    # SHA. Harmless, but GitPython otherwise dumps a 15-line "Bad git
+    # executable" block into every training task log.
+    GIT_PYTHON_REFRESH: quiet
+  volumes:
+    - ./dags:/opt/airflow/dags
+    - ./src:/opt/airflow/src
+    - ./data:/opt/airflow/data
+    - ./logs:/opt/airflow/logs
+    - ./plugins:/opt/airflow/plugins
+  user: "${AIRFLOW_UID:-50000}:0"
+  depends_on:
+    postgres:
+      condition: service_healthy
 
 services:
+  # --- Training pipeline -----------------------------------------------------
+
+  postgres:
+    image: postgres:15
+    container_name: ampops-postgres
+    environment:
+      POSTGRES_USER: airflow
+      POSTGRES_PASSWORD: airflow
+      POSTGRES_DB: airflow
+    volumes:
+      - postgres-data:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD", "pg_isready", "-U", "airflow"]
+      interval: 5s
+      retries: 10
+    restart: unless-stopped
+
+  mlflow:
+    # Pinned to match the mlflow client in requirements-airflow.txt — client/
+    # server skew on :latest is a classic source of registry errors.
+    image: ghcr.io/mlflow/mlflow:v2.16.2
+    container_name: ampops-mlflow
+    ports:
+      # Host 5050, not 5000: on macOS the AirPlay Receiver (ControlCenter)
+      # already owns 0.0.0.0:5000, so publishing there fails with "address
+      # already in use". Inside the compose network this is still port 5000,
+      # so MLFLOW_TRACKING_URI=http://mlflow:5000 is unaffected.
+      - "5050:5000"
+    # --serve-artifacts proxies artifact upload through the tracking server.
+    # Without it, clients would try to write to /mlartifacts, a path that only
+    # exists inside this container, and model logging from Airflow would fail.
+    # The backend store lives on the volume too, so runs survive a recreate.
+    command: >
+      mlflow server
+      --host 0.0.0.0
+      --port 5000
+      --backend-store-uri sqlite:////mlartifacts/mlflow.db
+      --artifacts-destination /mlartifacts
+      --serve-artifacts
+    volumes:
+      - mlflow-data:/mlartifacts
+    restart: unless-stopped
+
+  airflow-init:
+    <<: *airflow-common
+    container_name: ampops-airflow-init
+    entrypoint: /bin/bash
+    command:
+      - -c
+      - |
+        airflow db migrate
+        airflow users create \
+          --username "$${AIRFLOW_ADMIN_USER:-admin}" \
+          --password "$${AIRFLOW_ADMIN_PASSWORD:-admin}" \
+          --firstname Amp --lastname Ops --role Admin \
+          --email admin@ampops.local || true
+    environment:
+      <<: *airflow-common-env
+      AIRFLOW_ADMIN_USER: ${AIRFLOW_ADMIN_USER:-admin}
+      AIRFLOW_ADMIN_PASSWORD: ${AIRFLOW_ADMIN_PASSWORD:-admin}
+    restart: on-failure
+
+  airflow-scheduler:
+    <<: *airflow-common
+    container_name: ampops-airflow-scheduler
+    command: scheduler
+    depends_on:
+      postgres:
+        condition: service_healthy
+      airflow-init:
+        condition: service_completed_successfully
+    restart: unless-stopped
+
+  airflow-webserver:
+    <<: *airflow-common
+    container_name: ampops-airflow-webserver
+    command: webserver
+    ports:
+      - "8080:8080"
+    depends_on:
+      postgres:
+        condition: service_healthy
+      airflow-init:
+        condition: service_completed_successfully
+    healthcheck:
+      test: ["CMD", "curl", "--fail", "http://localhost:8080/health"]
+      interval: 15s
+      timeout: 10s
+      retries: 10
+      start_period: 60s
+    restart: unless-stopped
+
+  # --- Serving & dashboards (profile: serving) -------------------------------
+
   api:
     build: .
     container_name: ampops-api
+    profiles: ["serving"]
     env_file: .env
     ports:
       - "8000:8000"
@@ -16,38 +151,16 @@ services:
   redis:
     image: redis:7-alpine
     container_name: ampops-redis
+    profiles: ["serving"]
     ports:
       - "6379:6379"
     volumes:
       - redis-data:/data
 
-  mlflow:
-    image: ghcr.io/mlflow/mlflow:latest
-    container_name: ampops-mlflow
-    ports:
-      - "5000:5000"
-    command: >
-      mlflow server
-      --host 0.0.0.0
-      --port 5000
-      --backend-store-uri sqlite:///mlflow.db
-      --default-artifact-root /mlartifacts
-    volumes:
-      - mlflow-data:/mlartifacts
-
-  postgres:
-    image: postgres:15
-    container_name: ampops-postgres
-    environment:
-      POSTGRES_USER: airflow
-      POSTGRES_PASSWORD: airflow
-      POSTGRES_DB: airflow
-    volumes:
-      - postgres-data:/var/lib/postgresql/data
-
   prometheus:
     image: prom/prometheus:latest
     container_name: ampops-prometheus
+    profiles: ["serving"]
     ports:
       - "9090:9090"
     volumes:
@@ -58,6 +171,7 @@ services:
   grafana:
     image: grafana/grafana:latest
     container_name: ampops-grafana
+    profiles: ["serving"]
     ports:
       - "3000:3000"
     volumes:

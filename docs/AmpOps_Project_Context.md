@@ -124,6 +124,7 @@ Feed each scenario through the deployed API and capture what Evidently flags (or
 - [X] Confirm Prefect/MLflow/FastAPI/Evidently stack, or flag if anyone has a strong reason to deviate
 - [ ] Finalize the shared data contract (joined dataset schema + API request/response schema) before workstreams diverge
 - [ ] Confirm the DST-realignment approach (fixed-offset conversion) holds up under the hour-of-day sanity check once implemented.
+- [X] **COMED timezone interpretation — RESOLVED.** The two sources are one hour apart in summer and aligned in winter; the notebook's realignment had it backwards. `config.TIMEZONE_STRATEGY` now defaults to `"eastern"` (summer −1h). Every bake-off model improved: XGBoost 4.45% → 4.18% MAPE. See `docs/timezone_alignment_finding.md`. **Anyone holding a pre-correction `data/processed/*.parquet` must regenerate it.**
 
 ## 9. Task Managmenent
 
