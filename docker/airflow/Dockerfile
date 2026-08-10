@@ -8,8 +8,12 @@ FROM apache/airflow:2.9.3-python3.11
 USER root
 # libgomp is XGBoost's OpenMP runtime — the slim base image omits it and
 # `import xgboost` fails without it.
+# openjdk-17-jre-headless is for H2O (src/ampops/training/automl.py):
+# h2o.init() launches a local Java process, and the base image ships no JRE.
+# H2O 3.46.x supports Java 8-17 (21 is not yet supported); 17 is the newest
+# supported LTS and matches the h2o==<pin> version below.
 RUN apt-get update \
-    && apt-get install -y --no-install-recommends libgomp1 \
+    && apt-get install -y --no-install-recommends libgomp1 openjdk-17-jre-headless \
     && apt-get clean \
     && rm -rf /var/lib/apt/lists/*
 
