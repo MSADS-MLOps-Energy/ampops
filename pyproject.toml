@@ -9,7 +9,9 @@ license = { text = "MIT" }
 [tool.ruff]
 line-length = 100
 target-version = "py311"
-exclude = ["mlruns", "mlartifacts", "data", ".venv"]
+# notebooks/ is excluded deliberately: they are EDA artifacts, and linting them
+# to library standards (no unused imports, no semicolons) fights the medium.
+exclude = ["mlruns", "mlartifacts", "data", ".venv", "notebooks", "logs"]
 
 [tool.ruff.lint]
 select = ["E", "F", "I", "W", "UP"]
@@ -17,4 +19,6 @@ ignore = ["E501"]
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]
-pythonpath = ["."]
+# "src" makes `import ampops` resolve without an editable install; "." keeps
+# the DAG importable for the dags/ smoke test.
+pythonpath = ["src", "."]
