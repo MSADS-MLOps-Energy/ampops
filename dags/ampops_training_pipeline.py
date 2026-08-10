@@ -3,7 +3,7 @@
     ingest_raw -> validate_raw -> clean_and_join -> validate_joined
         -> build_features -> split_train_test
         -> run_automl (H2O AutoML search over algorithms + hyperparameters)
-        -> register_champion
+        -> register_champion -> evaluate_test
 
 This module is orchestration only: every task body is a thin call into the
 `ampops` package under src/. That separation is deliberate — the business logic
@@ -23,8 +23,7 @@ from ampops import config
 from ampops.data import clean, ingest, join, validate
 from ampops.features.build import build_features as build_features_fn
 from ampops.features.split import time_split
-from ampops.training import automl
-from ampops.training.registry import register_champion
+from ampops.training import automl, registry
 from ampops.utils.io import read_parquet, write_parquet
 
 NAIVE_JOIN_PARQUET = config.INTERIM_DIR / "naive_join.parquet"
@@ -38,7 +37,7 @@ DEFAULT_ARGS = {
 
 @dag(
     dag_id="ampops_training_pipeline",
-    description="Clean, join, feature-engineer, AutoML search, and register the demand forecaster",
+    description="Clean, join, feature-engineer, AutoML search, register, and test-evaluate the demand forecaster",
     # Manual trigger for the demo. Switch to "@daily" for a scheduled retrain.
     schedule=None,
     start_date=pendulum.datetime(2025, 8, 1, tz="UTC"),
@@ -127,7 +126,19 @@ def ampops_training_pipeline():
     @task
     def register(champion: dict) -> dict:
         """Promote the champion into the MLflow Model Registry as @champion."""
-        return register_champion(champion)
+        return registry.register_champion(champion)
+
+    @task
+    def evaluate_test(registration: dict, test_path: str) -> dict:
+        """Reload the just-registered champion and score it on the sealed test holdout.
+
+        Runs after registration, not before — model selection is decided on
+        train/validate alone (see ampops.training.automl); this only scores
+        and tags the version that's already been promoted to @champion.
+        """
+        model_uri = f"models:/{registration['registered_model']}/{registration['version']}"
+        metrics = automl.evaluate_on_test(model_uri, test_path)
+        return registry.tag_test_metrics(registration, metrics)
 
     raw = ingest_raw()
     validated_raw = validate_raw(raw)
@@ -136,7 +147,7 @@ def ampops_training_pipeline():
     features_path = build_features(joined_path)
     splits = split_train_test(features_path)
 
-    register(run_automl(splits["train"]))
+    evaluate_test(register(run_automl(splits["train"])), splits["test"])
 
 
 ampops_training_pipeline()

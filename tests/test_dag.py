@@ -46,6 +46,7 @@ def test_task_dependencies_form_the_expected_chain(dagbag):
         "split_train_test",
         "run_automl",
         "register",
+        "evaluate_test",
     }
     assert expected <= ids, f"missing tasks: {expected - ids}"
 
@@ -54,6 +55,10 @@ def test_task_dependencies_form_the_expected_chain(dagbag):
     assert "validate_raw" in {t.task_id for t in dag.get_task("clean_and_join").upstream_list}
     assert "validate_joined" in {t.task_id for t in dag.get_task("build_features").upstream_list}
     assert "run_automl" in {t.task_id for t in dag.get_task("register").upstream_list}
+    # Test evaluation must happen after registration, never before — model
+    # selection is decided on train/validate alone.
+    assert "register" in {t.task_id for t in dag.get_task("evaluate_test").upstream_list}
+    assert "split_train_test" in {t.task_id for t in dag.get_task("evaluate_test").upstream_list}
 
 
 def test_catchup_is_disabled(dagbag):
