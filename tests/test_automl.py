@@ -15,10 +15,11 @@ import pytest
 
 pytest.importorskip("h2o", reason="H2O only installed where the AutoML step runs")
 
+from mlflow.tracking import MlflowClient  # noqa: E402
+
 from ampops import config  # noqa: E402
 from ampops.features.build import build_features  # noqa: E402
-from ampops.training import automl  # noqa: E402
-from ampops.training.registry import register_champion  # noqa: E402
+from ampops.training import automl, registry  # noqa: E402
 
 
 @pytest.fixture
@@ -50,8 +51,34 @@ def synthetic_train_path(tmp_path) -> str:
     return str(path)
 
 
+@pytest.fixture
+def synthetic_test_path(tmp_path) -> str:
+    """A small, later time slice standing in for the sealed test holdout.
+
+    Built the same way as `synthetic_train_path` but from a distinct, later
+    date range and a different RNG seed, so it exercises `evaluate_on_test`
+    against a genuinely separate frame rather than reusing training rows.
+    """
+    times = pd.date_range("2015-08-01", periods=24 * 30, freq="h")  # ~1 month
+    rng = np.random.default_rng(1)
+    raw = pd.DataFrame(
+        {
+            config.TIME_COL: times,
+            config.TARGET: 10_000
+            + 500 * np.sin(np.arange(len(times)) / 24)
+            + rng.normal(0, 10, len(times)),
+            "temperature_2m": rng.normal(5, 3, len(times)),
+        }
+    )
+
+    features = build_features(raw)
+    path = tmp_path / "test.parquet"
+    features.to_parquet(path)
+    return str(path)
+
+
 def test_run_h2o_automl_returns_a_valid_champion_scorecard(
-    synthetic_train_path, tmp_path, monkeypatch
+    synthetic_train_path, synthetic_test_path, tmp_path, monkeypatch
 ):
     # Keep the search tiny so the test runs fast — real overrides the function
     # reads live, not hardcoded, per `automl.run_h2o_automl`'s use of `config.*`.
@@ -86,7 +113,7 @@ def test_run_h2o_automl_returns_a_valid_champion_scorecard(
 
     # --- the dict is a valid input to register_champion() (stronger check:
     # actually call it against the same isolated tracking URI) ---
-    registration = register_champion(
+    registration = registry.register_champion(
         result, model_name="test-ampops-model", tracking_uri=tracking_uri
     )
 
@@ -94,3 +121,25 @@ def test_run_h2o_automl_returns_a_valid_champion_scorecard(
     assert registration["run_id"] == result["run_id"]
     assert registration["algorithm"] == result["model_name"]
     assert registration["model_uri"] == "models:/test-ampops-model@champion"
+
+    # --- evaluate the already-registered champion on the sealed test holdout,
+    # then tag the result onto that same registered version (never before
+    # registration, never influencing which model was chosen) ---
+    versioned_uri = f"models:/{registration['registered_model']}/{registration['version']}"
+    test_metrics = automl.evaluate_on_test(
+        versioned_uri, synthetic_test_path, tracking_uri=tracking_uri
+    )
+
+    for metric in ("test_mape", "test_rmse", "test_mae"):
+        assert isinstance(test_metrics[metric], float)
+        assert test_metrics[metric] >= 0
+    assert isinstance(test_metrics["n_test"], int) and test_metrics["n_test"] > 0
+
+    tagged = registry.tag_test_metrics(registration, test_metrics, tracking_uri=tracking_uri)
+    assert tagged["test_mape"] == test_metrics["test_mape"]
+
+    version_info = MlflowClient(tracking_uri=tracking_uri).get_model_version(
+        registration["registered_model"], registration["version"]
+    )
+    assert "test_mape" in version_info.tags
+    assert "test_rmse" in version_info.tags

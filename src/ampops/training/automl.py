@@ -5,6 +5,11 @@ removed) with `H2OAutoML`, which trains and ranks a pool of models itself.
 `ampops.training.registry.select_champion` is gone for the same reason — H2O
 already hands back a single leader, so there is nothing left to pick between.
 
+`run_h2o_automl` only ever sees train/validate data — model selection never
+touches the sealed test holdout. `evaluate_on_test` is a separate, standalone
+function that scores an *already-registered* model against that holdout; the
+DAG calls it after `registry.register_champion`, not as part of this search.
+
 **No k-fold cross-validation.** `data/processed/train.parquet` is time-ordered
 (lag/rolling features reference the past, per `ampops.features.build`), so
 shuffling rows across folds — H2O AutoML's default — would let future rows
@@ -143,5 +148,51 @@ def run_h2o_automl(
             result["run_id"],
         )
         return result
+    finally:
+        h2o.cluster().shutdown()
+
+
+def evaluate_on_test(
+    model_uri: str,
+    test_path: str,
+    tracking_uri: str | None = None,
+) -> dict[str, float]:
+    """Score an already-registered model against the sealed test holdout.
+
+    Deliberately separate from `run_h2o_automl`: model selection is decided on
+    train/validate alone (see module docstring), and this function only ever
+    runs after a champion has already been chosen and registered. It reloads
+    the model by its MLflow registry URI rather than reusing anything from the
+    training run, so it works equally well on any registered version, not just
+    one freshly produced by this pipeline. Same H2O cluster lifecycle
+    discipline as `run_h2o_automl` (fresh port, `finally`-shutdown) since this
+    runs as its own Airflow task/process with no cluster to inherit.
+    """
+    mlflow.set_tracking_uri(tracking_uri or config.MLFLOW_TRACKING_URI)
+
+    test_df = pd.read_parquet(test_path)
+    features = feature_columns(test_df)
+
+    port = _free_port()
+    h2o.init(port=port, start_h2o=True)
+    try:
+        model = mlflow.h2o.load_model(model_uri)
+        test_h2o = h2o.H2OFrame(test_df[[*features, config.TARGET]])
+        y_pred = model.predict(test_h2o).as_data_frame()["predict"].to_numpy()
+        metrics = evaluate(test_df[config.TARGET], y_pred)
+
+        logger.info(
+            "Test-set evaluation of %s | MAPE %.4f | RMSE %.1f MW | n=%d",
+            model_uri,
+            metrics["mape"],
+            metrics["rmse"],
+            len(test_df),
+        )
+        return {
+            "test_mape": metrics["mape"],
+            "test_rmse": metrics["rmse"],
+            "test_mae": metrics["mae"],
+            "n_test": len(test_df),
+        }
     finally:
         h2o.cluster().shutdown()

@@ -9,8 +9,12 @@ carve-out (still reused by `ampops.training.automl`).
 
 **Model selection never touches the test set.** Candidates are scored on a
 validation tail carved out of the *training* data; `data/processed/test.parquet`
-stays sealed until the deployment workstream validates the registered model
-against the live API.
+stays sealed through the entire search and registration. Once a champion is
+registered, `ampops.training.automl.evaluate_on_test` reloads that exact
+version and scores it against `test.parquet` for reporting —
+`ampops.training.registry.tag_test_metrics` then tags the result onto the
+already-registered model version. That evaluation happens strictly after
+selection and promotion are final; it never feeds back into which model wins.
 """
 
 from __future__ import annotations

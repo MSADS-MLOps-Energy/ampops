@@ -5,6 +5,11 @@ directly with the scorecard dict produced by `ampops.training.automl.run_h2o_aut
 (H2O AutoML already returns a single winner, so no separate champion-selection
 step is needed). Changing the promotion policy (say, requiring the champion to
 beat the incumbent by some margin) means editing this file, not the DAG.
+
+`tag_test_metrics` is a separate, later step: it runs after registration and
+after `ampops.training.automl.evaluate_on_test` has scored the already-
+registered version against the sealed test holdout. It only annotates that
+version with the result — it does not re-decide or re-promote anything.
 """
 
 from __future__ import annotations
@@ -67,3 +72,35 @@ def register_champion(
         "algorithm": champion["model_name"],
         "model_uri": f"models:/{model_name}@champion",
     }
+
+
+def tag_test_metrics(
+    registration: dict[str, Any],
+    metrics: dict[str, float],
+    tracking_uri: str | None = None,
+) -> dict[str, Any]:
+    """Write a champion's sealed-test-set score onto the version that's already registered.
+
+    Runs after `register_champion`, not as part of it — model selection and
+    promotion to `@champion` are already final by the time this is called
+    (see `ampops.training.automl.evaluate_on_test`). This only tags the result;
+    it never re-decides or re-promotes anything.
+    """
+    mlflow.set_tracking_uri(tracking_uri or config.MLFLOW_TRACKING_URI)
+    client = MlflowClient()
+
+    for key in ("test_mape", "test_rmse", "test_mae"):
+        if key in metrics:
+            client.set_model_version_tag(
+                registration["registered_model"], registration["version"], key, f"{metrics[key]:.6f}"
+            )
+            client.log_metric(registration["run_id"], key, metrics[key])
+
+    logger.info(
+        "Tagged %s v%s with test-set metrics (MAPE %.4f, RMSE %.1f MW)",
+        registration["registered_model"],
+        registration["version"],
+        metrics.get("test_mape", float("nan")),
+        metrics.get("test_rmse", float("nan")),
+    )
+    return {**registration, **metrics}
