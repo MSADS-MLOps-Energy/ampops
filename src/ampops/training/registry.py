@@ -1,9 +1,10 @@
-"""Champion selection and MLflow Model Registry promotion.
+"""MLflow Model Registry promotion.
 
-Owned by the experiment-tracking workstream. The DAG calls only
-`select_champion` and `register_champion`; changing the promotion policy (say,
-requiring the champion to beat the incumbent by some margin) means editing this
-file, not the DAG.
+Owned by the experiment-tracking workstream. The DAG calls `register_champion`
+directly with the scorecard dict produced by `ampops.training.automl.run_h2o_automl`
+(H2O AutoML already returns a single winner, so no separate champion-selection
+step is needed). Changing the promotion policy (say, requiring the champion to
+beat the incumbent by some margin) means editing this file, not the DAG.
 """
 
 from __future__ import annotations
@@ -17,22 +18,6 @@ from ampops import config
 from ampops.utils.io import get_logger
 
 logger = get_logger(__name__)
-
-
-def select_champion(results: list[dict[str, Any]]) -> dict[str, Any]:
-    """Pick the candidate with the lowest primary metric (MAPE)."""
-    if not results:
-        raise ValueError("select_champion received no candidate results")
-
-    champion = min(results, key=lambda r: r[config.PRIMARY_METRIC])
-    ranking = sorted(results, key=lambda r: r[config.PRIMARY_METRIC])
-    logger.info(
-        "Bake-off ranking by %s: %s",
-        config.PRIMARY_METRIC,
-        ", ".join(f"{r['model_name']}={r[config.PRIMARY_METRIC]:.4f}" for r in ranking),
-    )
-    logger.info("Champion: %s (run %s)", champion["model_name"], champion["run_id"])
-    return champion
 
 
 def register_champion(

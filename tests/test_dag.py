@@ -17,8 +17,6 @@ pytest.importorskip("airflow", reason="Airflow only installed in the pipeline im
 
 from airflow.models import DagBag  # noqa: E402
 
-from ampops import config  # noqa: E402
-
 DAG_ID = "ampops_training_pipeline"
 
 
@@ -46,8 +44,7 @@ def test_task_dependencies_form_the_expected_chain(dagbag):
         "validate_joined",
         "build_features",
         "split_train_test",
-        "train",
-        "choose_champion",
+        "run_automl",
         "register",
     }
     assert expected <= ids, f"missing tasks: {expected - ids}"
@@ -56,15 +53,7 @@ def test_task_dependencies_form_the_expected_chain(dagbag):
     # dropped, bad data reaches training silently.
     assert "validate_raw" in {t.task_id for t in dag.get_task("clean_and_join").upstream_list}
     assert "validate_joined" in {t.task_id for t in dag.get_task("build_features").upstream_list}
-    assert "train" in {t.task_id for t in dag.get_task("choose_champion").upstream_list}
-
-
-def test_training_task_is_dynamically_mapped(dagbag):
-    """One mapped instance per entry in MODEL_CONFIGS, with no DAG edit needed."""
-    dag = dagbag.dags[DAG_ID]
-    train = dag.get_task("train")
-
-    assert train.get_parse_time_mapped_ti_count() == len(config.MODEL_CONFIGS)
+    assert "run_automl" in {t.task_id for t in dag.get_task("register").upstream_list}
 
 
 def test_catchup_is_disabled(dagbag):
