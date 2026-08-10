@@ -1,13 +1,17 @@
 # AutoML implementation: H2O AutoML (replacing the hardcoded bake-off)
 
-**Status: implemented and validated.** `ampops.training.automl.run_h2o_automl()`
-is real, tested (`tests/test_automl.py`, real H2O runs, not mocked), wired into
+**Status: implemented and validated, including the register → evaluate-on-test
+→ tag flow, with a real registered model version live in MLflow.**
+`ampops.training.automl.run_h2o_automl()` / `evaluate_on_test()` and
+`ampops.training.registry.register_champion()` / `tag_test_metrics()` are
+real, tested (`tests/test_automl.py`, real H2O runs, not mocked), wired into
 `dags/ampops_training_pipeline.py`, and validated end-to-end against both
-synthetic data and the real `data/processed/train.parquet`. The full test
-suite (72 tests) has been re-run inside the actual `docker compose` stack
-(Java 17 + H2O + Airflow), not just a bare `.venv` — see "Validation
-performed" below. This document describes what was actually built, not a
-plan.
+synthetic data and the real `data/processed/train.parquet`/`test.parquet` —
+including an actual model registered in the running MLflow instance
+(`ampops-demand-forecaster` v1, `@champion`). The full test suite (72 tests)
+has been re-run inside the actual `docker compose` stack (Java 17 + H2O +
+Airflow), not just a bare `.venv` — see "Validation performed" below. This
+document describes what was actually built, not a plan.
 
 ## Summary
 
@@ -71,7 +75,7 @@ It is called from a new `run_automl` Airflow task in
 wiring is now:
 
 ```
-register(run_automl(splits["train"]))
+evaluate_test(register(run_automl(splits["train"])), splits["test"])
 ```
 
 `register()` (in `src/ampops/training/registry.py`) was **not** modified —
@@ -159,6 +163,54 @@ Step by step:
    the `ampops-demand-forecaster` registered model exactly as it did before
    this change.
 
+### Test-set evaluation: register → evaluate on test → tag
+
+`run_h2o_automl()` only ever sees train/validate data — the sealed
+`data/processed/test.parquet` holdout stays untouched through the whole
+search and through registration. Closing the "train/validate/**test**" loop
+was deliberately built as a separate, later step rather than folded into
+`run_h2o_automl()` itself, so that model selection can never be influenced by
+test-set performance and so the same evaluation logic can be pointed at *any*
+registered model version later, not just one freshly produced by this run:
+
+1. **`register_champion()`** (unchanged) promotes the AutoML leader to
+   `@champion` exactly as before — this step doesn't know or care that a test
+   evaluation is coming next.
+2. **`automl.evaluate_on_test(model_uri, test_path, tracking_uri=None)`**
+   (new) reloads the *exact* registered version via its
+   `models:/<name>/<version>` URI — not the `@champion` alias, so a
+   concurrent run moving the alias can't change what gets scored — using
+   `mlflow.h2o.load_model()`, scores it against `test.parquet` with the same
+   `bakeoff.evaluate()` helper used everywhere else, and returns
+   `{"test_mape", "test_rmse", "test_mae", "n_test"}`. It manages its own
+   fresh H2O cluster (same `_free_port()` + `finally`-shutdown discipline as
+   `run_h2o_automl`), since it runs as an independent Airflow task/process
+   with nothing to inherit from the training task.
+3. **`registry.tag_test_metrics(registration, metrics, tracking_uri=None)`**
+   (new) writes `test_mape` / `test_rmse` / `test_mae` onto the already-
+   registered model version as MLflow model-version tags, and also logs them
+   onto the original training run (`MlflowClient.log_metric`, since there's
+   no active run context at this point) so validation and test metrics live
+   side by side. It does not re-decide or re-promote anything — no
+   pass/fail gate was added; this is reporting/tagging only, by design.
+
+The DAG wires this as a new `evaluate_test` task immediately after
+`register`, taking both the registration dict and `splits["test"]`:
+
+```python
+@task
+def evaluate_test(registration: dict, test_path: str) -> dict:
+    model_uri = f"models:/{registration['registered_model']}/{registration['version']}"
+    metrics = automl.evaluate_on_test(model_uri, test_path)
+    return registry.tag_test_metrics(registration, metrics)
+```
+
+`tests/test_automl.py` covers this live: after registering a synthetic
+champion, it calls `evaluate_on_test()` against a distinct synthetic
+test-holdout fixture, then `tag_test_metrics()`, then independently confirms
+via `MlflowClient.get_model_version(...).tags` that the tags actually landed
+on the registry — not just that the function returned without error.
+
 ### Config knobs
 
 `src/ampops/config.py`:
@@ -237,20 +289,34 @@ Homebrew installed it — this is the most common local setup snag.
   confirms `test_automl.py`'s live H2O search + `register_champion()`
   hand-off succeed in the actual production-shaped environment, not just a
   bare `.venv`.
-- Also attempted a live end-to-end trigger of `ampops_training_pipeline` via
-  `airflow dags trigger` against the running stack. It failed at the very
-  first task, `ingest_raw`, with `OSError: [Errno 35] Resource deadlock
-  avoided` reading the weather CSV — reproduced even with a plain `wc -l` on
-  that exact file path inside the container, while the same file read fine
-  from the host. `lsof` on the host showed a macOS Spotlight indexer process
-  holding the file open concurrently. This is a known macOS Docker Desktop
-  bind-mount (gRPC-FUSE/VirtioFS) interaction triggered by a large file
-  being read from both sides at once — an environment/OS quirk in
-  `ingest_raw`'s CSV read, unrelated to `run_automl`/H2O (the pipeline never
-  got far enough to reach the AutoML step). Not fixed as part of this work;
-  noted here so it isn't mistaken for an AutoML defect if hit again. The
-  in-container pytest run above is the authoritative validation of the
-  AutoML step itself.
+- Attempted a live end-to-end trigger of `ampops_training_pipeline` via
+  `airflow dags trigger` against the running stack, twice (including once
+  against a completely fresh Docker Desktop VM, restarted specifically to
+  rule out session-accumulated state). Both times it failed at `clean_and_join`
+  writing `joined_hourly.parquet` with `OSError: [Errno 35] Resource deadlock
+  avoided` — the same error class as an earlier session's failure reading the
+  weather CSV at `ingest_raw`. **This is an open, unresolved Docker
+  Desktop/VirtioFS bug, not an AutoML or pipeline-code defect** — full
+  root-cause investigation, evidence, and recommended fixes are in
+  **`docs/virtiofs_errno35_deadlock.md`**; that document also corrects an
+  earlier (incorrect) "Spotlight indexer" theory from a prior session. In
+  short: a per-inode VirtioFS lock-state bug in Docker Desktop's own VM
+  process, worked around (not fixed) this session by copying the affected
+  files to fresh inodes from the host side.
+- **Live validation, real data, registered for real**: with that workaround,
+  ran `automl.run_h2o_automl()` → `registry.register_champion()` →
+  `automl.evaluate_on_test()` → `registry.tag_test_metrics()` directly
+  against the actual `data/processed/train.parquet` (54,321 rows) /
+  `test.parquet` (2,208 train-internal-validation + 8,591 sealed-test rows)
+  inside the real `airflow-scheduler` container (Java 17, `h2o==3.46.0.11`).
+  Result: DRF leader, **validation MAPE 0.0425 / RMSE 745.2 MW**, **test MAPE
+  0.0302 / RMSE 519.3 MW**. Registered as `ampops-demand-forecaster` v1,
+  `@champion` alias confirmed resolving to v1, tags confirmed present via
+  `MlflowClient`: `semantic_version=1.1.0`, `algorithm=drf`,
+  `mape=0.042476`, `rmse=745.199651`, `test_mape=0.030194`,
+  `test_rmse=519.344517`, `test_mae=351.253249`. Test MAPE beating
+  validation MAPE here is incidental to this particular random split, not a
+  general guarantee.
 
 ## Known limitations / forward-looking notes
 
