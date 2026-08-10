@@ -78,7 +78,13 @@ fails at `validate_raw` with a specific message rather than silently producing a
 bad model.
 
 Everything under `data/interim/` and `data/processed/` is generated — never
-commit it, and never hand-edit it.
+commit it, and never hand-edit it. Inside the Docker stack these two stages are
+**named volumes**, not host directories: the pipeline rewrites the same fixed
+paths on every run, and doing that across a macOS bind mount trips a Docker
+Desktop/VirtioFS bug (`docs/virtiofs_errno35_deadlock.md`). Use `make
+data-export` to copy the generated parquets back to the host, and `make
+data-import` to push host copies in. `data/raw/` is unaffected — it stays
+bind-mounted, so dropping the two CSVs there is all the setup it needs.
 
 ### Reproducing the training pipeline
 
@@ -106,15 +112,18 @@ Open the Airflow UI, find **`ampops_training_pipeline`**, and trigger it with th
 ```
 ingest_raw → validate_raw → clean_and_join → validate_joined
   → build_features → split_train_test
-  → run_automl → register
+  → run_automl → register → evaluate_test
 ```
 
 `run_automl` runs an H2O AutoML search (up to `AUTOML_MAX_MODELS` candidates,
-bounded by `AUTOML_MAX_RUNTIME_SECS`) and hands its leader straight to
-`register`. On success you'll have
-`data/processed/{joined_hourly,features,train,test}.parquet` on the host, an
-MLflow run per model H2O trained, and `ampops-demand-forecaster` registered
-with the `@champion` alias. See `docs/automl_implementation.md` for how the
+bounded by `AUTOML_MAX_RUNTIME_SECS`) and hands its leader to `register`, which
+promotes it to `@champion`; `evaluate_test` then reloads that exact registered
+version and scores it against the sealed test holdout, tagging the result. On
+success you'll have `{joined_hourly,features,train,test}.parquet` in the
+`ampops-data-processed` volume (`make data-export` copies them to
+`data/processed/` on the host), an MLflow run per model H2O trained, and
+`ampops-demand-forecaster` registered with the `@champion` alias plus
+validation and test metrics. See `docs/automl_implementation.md` for how the
 search works and how to run it locally (it needs a local JVM outside Docker).
 
 Or trigger the same run from the command line:

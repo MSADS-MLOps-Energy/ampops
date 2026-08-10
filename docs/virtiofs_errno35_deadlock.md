@@ -1,6 +1,8 @@
 # DAG-trigger bug: `OSError: [Errno 35] Resource deadlock avoided`
 
-**Status: open, unresolved. Currently worked around, not fixed.** `airflow dags trigger ampops_training_pipeline` cannot be relied on to complete end-to-end on this stack yet — it fails non-deterministically on ordinary file reads/writes inside tasks that touch `data/`. This document is a handoff for whoever picks up fixing it for real; see "Recommended fix" at the bottom.
+**Status: fixed** (2026-08-10) by applying option 2 below — `data/interim`, `data/processed` and `logs/` now live in named Docker volumes instead of host bind mounts, so the DAG's hot rewrite paths never cross VirtioFS. See "Applied fix" near the bottom for exactly what changed and what deliberately did not. One bind mount that has failed before (`data/raw`) is still bind-mounted by design; see "Residual risk".
+
+The rest of this document is the original investigation, kept as-is because it's the reasoning the fix rests on.
 
 ## Symptom
 
@@ -54,9 +56,9 @@ Copying the affected file to a **new path from the host side** (`cp data/process
 
 This is a manual, one-off workaround — it is **not** something the DAG can do for itself today, since the poisoned inode is only discovered by hitting the error in the first place, and the DAG's own tasks (`clean_and_join`, etc.) write to fixed, well-known paths (`config.JOINED_PARQUET`, etc.) by design, not fresh paths per run.
 
-## Recommended fix (for whoever picks this up)
+## Options considered
 
-Two structural options, either of which should make the DAG reliably operational without manual intervention. Neither has been applied yet — this needs a decision, then implementation:
+Two structural options, either of which should make the DAG reliably operational without manual intervention. **Option 2 is the one that was applied** — see "Applied fix" below.
 
 1. **Switch Docker Desktop's file-sharing backend from VirtioFS to gRPC-FUSE.** Docker Desktop → Settings → Resources → File sharing. This is the standard community workaround for this exact bug class (VirtioFS mmap/lock-negotiation issues on macOS are a known, still-open category of Docker Desktop bugs). Pros: no code or `docker-compose.yml` change needed. Cons: slower I/O than VirtioFS; it's a per-developer-machine setting, not something enforceable or documented in the repo itself — every teammate would need to change it locally, and there's no way to verify a teammate has it set correctly from CI or from the repo.
 
@@ -64,7 +66,44 @@ Two structural options, either of which should make the DAG reliably operational
 
    Per the investigation above (point 6), the risk isn't tied to *which* file — it's tied to *fixed paths the DAG rewrites on every run/retry*. That's every intermediate this pipeline produces: `data/interim/comed_hourly.parquet`, `data/interim/weather_hourly.parquet`, `data/processed/joined_hourly.parquet`, `data/processed/features.parquet`, `data/processed/train.parquet`, `data/processed/test.parquet`. A reasonable split, if full host visibility into `data/` matters (e.g. `joined_hourly.parquet` is also a project deliverable referenced by `notebooks/01_join_and_eda.ipynb` and validated against `config.EXPECTED_JOINED_ROWS`/`EXPECTED_JOINED_COLS`, so there's a real reason to want it browsable): move only the purely-internal intermediates that nothing outside the DAG reads (`data/interim/*`, `features.parquet`, `train.parquet`, `test.parquet`) to a named volume, and leave `data/raw/` and `data/processed/joined_hourly.parquet` bind-mounted. That still doesn't make the bind-mounted files bulletproof — the very first incident was a plain read of the raw weather CSV, so read-heavy files aren't automatically exempt — but it removes the highest-frequency rewrite targets from VirtioFS entirely. So far the 3 recorded incidents were 1 read of a `data/raw` file and 2 writes of the same `data/processed/joined_hourly.parquet` — both categories this split would still leave bind-mounted, so treat "leave raw and the joined-hourly deliverable bind-mounted" as a risk-reduction move for the deepest, most-rewritten intermediates, not a guarantee that the remaining bind-mounted files are safe.
 
-Either fix should be validated by triggering `ampops_training_pipeline` several times in a row (the bug has reproduced 100% of the time so far, 3/3 attempts across two sessions, so a handful of clean runs would be reasonably strong evidence of a fix) before considering this resolved.
+## Applied fix
+
+Option 2, with a deliberately partial scope. Three files changed; **nothing under `src/ampops/` was touched** — the container-side paths are identical, so `ampops.config` resolves exactly as before.
+
+- **`docker-compose.yml`** — in `x-airflow-common.volumes`, `./data:/opt/airflow/data` and `./logs:/opt/airflow/logs` are replaced by:
+  - `./data/raw:/opt/airflow/data/raw:ro` — still a host bind mount, now read-only. Keeps the two raw CSVs drop-in from the host per README "Getting the data", with no seeding step. Nothing in the pipeline writes here.
+  - `ampops-data-interim:/opt/airflow/data/interim`, `ampops-data-processed:/opt/airflow/data/processed`, `ampops-logs:/opt/airflow/logs` — named volumes, declared in the top-level `volumes:` block. These are the fixed paths the DAG rewrites on every run and every retry (point 6 above), plus the highest-write-frequency mount in the stack.
+  - `./dags` and `./src` stay bind-mounted so code edits are still live without a rebuild. They're small, read-mostly, and no incident has ever been recorded on them.
+
+- **`docker/airflow/Dockerfile`** — a `mkdir -p` + `chown -R 50000:0` + `chmod -R 775` of `/opt/airflow/data` in the `USER root` block. **This is required, not cosmetic.** Docker initializes an empty named volume from whatever exists at its mount path in the image, *including ownership*; `apache/airflow:2.9.3-python3.11` has no `/opt/airflow/data` at all, so without this the two volumes come up `root:root` while the containers run as `user: "50000:0"`, and every `write_parquet()` fails with `EACCES` instead. (`/opt/airflow/logs` already ships as `50000:0` `drwxrwxr-x`, so the logs volume needs nothing.)
+
+- **`Makefile`** — `make data-export` (volume → `./data/processed`) and `make data-import` (the reverse), both via `docker compose cp`, which streams over the Docker API and never touches VirtioFS. There is deliberately **no** auto-export task in the DAG: writing to a bind-mounted fixed path at the end of every run would re-introduce exactly the access pattern that causes this bug. `make airflow-reset` (`docker compose down -v`) now also wipes generated pipeline data and task logs — its comment was updated to say so.
+
+`.env.example` and `README.md` were updated to match (the `AIRFLOW_UID=$(id -u)` advice no longer applies to `data`/`logs`, and generated parquets no longer appear on the host automatically).
+
+### Validation
+
+`make airflow-down && make airflow-up` (rebuilds the image), then verified the volumes come up `50000:0` `775` and writable as uid 50000, and that the raw CSVs are still visible through the read-only bind mount.
+
+Then triggered `ampops_training_pipeline` **three times consecutively** — the bar set above, given the bug had reproduced 100% of the time (3/3) before this. All three runs reached `success` on **all 9 tasks**, including `ingest_raw`, `clean_and_join` and `split_train_test`, the three tasks that had never previously survived. A `grep` for `Errno 35` / `EDEADLK` / `Resource deadlock` across every task log in the `ampops-logs` volume after all three runs returned nothing.
+
+Each run registered a new `ampops-demand-forecaster` version end-to-end with full tags (`semantic_version`, `algorithm=drf`, validation `mape`/`rmse`, and `test_mape`/`test_rmse`/`test_mae`), with `@champion` resolving to the newest — i.e. the AutoML → register → test-evaluate path now completes through the scheduler with no manual intervention. Representative run: validation MAPE 0.0423 / RMSE 741.9, test MAPE 0.0301 / RMSE 518.9.
+
+Also confirmed after the fix:
+
+- `make data-export` pulls the generated parquets to the host, and the exported `joined_hourly.parquet` is 66,493 rows × 32 cols — exactly `config.EXPECTED_JOINED_ROWS`/`EXPECTED_JOINED_COLS`.
+- The full test suite still passes in the rebuilt container: **72 passed** (`python -m pytest -q` in `airflow-scheduler`; `pytest` is not in the image, so `python -m pip install pytest` first).
+- Host-side flows are untouched — `make pipeline-local` still runs against `./data` and produces identical shapes, because `AMPOPS_DATA_DIR` is only set inside the containers.
+
+## Residual risk
+
+`data/raw` is still a host bind mount, and **incident #1 was a plain `pd.read_csv` on the raw weather CSV** — so that read path is not structurally immune. It is much lower-exposure than the paths that moved (read-only, read once per run, never rewritten), but it is not zero.
+
+If `ingest_raw` ever fails with `EDEADLK` again, escalate in this order:
+
+1. **Mint a fresh inode from the host** — `cp data/raw/<file> data/raw/<file>.new && mv data/raw/<file>.new data/raw/<file>`, run in the host terminal. This leaves the poisoned inode behind and unblocks the container immediately. Same mechanism as the "Verified workaround" above, applied to raw.
+2. **Move `data/raw` into a volume too** — swap the bind mount for `ampops-data-raw:/opt/airflow/data/raw` and add a `make data-seed` target (`docker compose cp data/raw/. airflow-scheduler:/opt/airflow/data/raw/`) to load it. This takes `data/` off VirtioFS entirely; the cost is that dropping a new CSV on the host no longer suffices.
+3. **Option 1, gRPC-FUSE** — the only remaining move, since `dags/` and `src/` must stay bind-mounted for live editing. Per-machine setting, not enforceable from the repo.
 
 ## Related
 

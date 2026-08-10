@@ -17,6 +17,16 @@ RUN apt-get update \
     && apt-get clean \
     && rm -rf /var/lib/apt/lists/*
 
+# data/interim and data/processed are named volumes (docker-compose.yml), and
+# Docker initializes an empty named volume from whatever exists at its mount
+# path in the image — including ownership. The base image has no
+# /opt/airflow/data at all, so without this the volumes would come up root-owned
+# and every write_parquet() would fail with EACCES for the airflow user.
+# (/opt/airflow/logs already ships as 50000:0 775, so it needs nothing here.)
+RUN mkdir -p /opt/airflow/data/raw /opt/airflow/data/interim /opt/airflow/data/processed \
+    && chown -R 50000:0 /opt/airflow/data \
+    && chmod -R 775 /opt/airflow/data
+
 USER airflow
 
 COPY requirements-airflow.txt /tmp/requirements-airflow.txt
