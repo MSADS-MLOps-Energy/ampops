@@ -145,6 +145,12 @@ MODEL_CONFIGS = [
     },
 ]
 
+# H2O AutoML search budget. These constants also govern smoke/CI runs (not
+# just full retrains), so keep the defaults to "a few minutes," not "as good
+# as possible" — override with the env vars for a deeper search on demand.
+AUTOML_MAX_RUNTIME_SECS = int(os.getenv("AMPOPS_AUTOML_MAX_RUNTIME_SECS", "300"))
+AUTOML_MAX_MODELS = int(os.getenv("AMPOPS_AUTOML_MAX_MODELS", "10"))
+
 # MAPE is the headline metric (scale-free, easy to justify); RMSE is the
 # secondary check because demand spikes are the failure mode that matters.
 PRIMARY_METRIC = "mape"
