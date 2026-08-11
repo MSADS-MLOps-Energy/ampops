@@ -27,3 +27,8 @@ holidays==0.47
 # pyarrow==16.1.0, and every mlflow before 2.16 caps pyarrow<16. Keep this in
 # sync with the mlflow server image tag in docker-compose.yml.
 mlflow==2.16.2
+# H2O AutoML backend (src/ampops/training/automl.py). H2O-3 requires
+# numpy<2 and this is confirmed compatible with the constraints file's
+# numpy==1.26.4 and pandas==2.1.4. Needs a JRE — see docker/airflow/Dockerfile
+# (openjdk-17-jre-headless; H2O 3.46.x supports Java 8-17).
+h2o==3.46.0.11

@@ -43,7 +43,7 @@ Upstream Raw Data Ingestion (PJM Grid + Open-Meteo Weather API)
 **Pipeline stages:**
 
 1. **Data Ingestion & Versioning** — Raw hourly telemetry lands in `data/raw/`. DVC tracks two dataset versions: `v1` (uncurated) and `v2` (deduplicated, DST-corrected, with engineered lag features `t-1`, `t-24`, `t-168` and 24-hour rolling means).
-2. **Pipeline Automation & Tracking** — An Airflow/Prefect DAG enforces chronological train/holdout splits (final 12 months held out). MLflow logs an XGBoost baseline against a PyTorch LSTM, then registers the winner with semantic versioning.
+2. **Pipeline Automation & Tracking** — An Airflow/Prefect DAG enforces chronological train/holdout splits (final 12 months held out). An H2O AutoML search (multiple algorithms, no cross-validation leakage across time-ordered rows) trains and evaluates candidates in one step, and MLflow logs and registers the leader with semantic versioning.
 3. **Containerization & Deployment** — The champion model is served via a Dockerized FastAPI app backed by a Redis feature cache. Clients pass only a `Grid_ID` and timestamp; the API resolves lag vectors from Redis. New challengers are deployed via shadow routing — evaluated in parallel but not yet acted on.
 4. **Monitoring & Drift Engineering** — Prometheus scrapes endpoint metrics into Grafana. Simulated drift events (unit-mismatch sensor corruption, decoupled temperature/demand vectors) validate resilience. Sustained MAPE > 5% over a 6-hour window fires a webhook that triggers automated retraining.
 
@@ -54,7 +54,7 @@ Upstream Raw Data Ingestion (PJM Grid + Open-Meteo Weather API)
 
 ## Tech Stack
 
-`Python` · `XGBoost` · `PyTorch` · `Airflow` / `Prefect` · `DVC` · `MLflow` · `FastAPI` · `Redis` · `Docker` · `Prometheus` · `Grafana` · `Ruff`
+`Python` · `H2O AutoML` · `Airflow` / `Prefect` · `DVC` · `MLflow` · `FastAPI` · `Redis` · `Docker` · `Prometheus` · `Grafana` · `Ruff`
 
 ## Getting Started
 
@@ -78,7 +78,13 @@ fails at `validate_raw` with a specific message rather than silently producing a
 bad model.
 
 Everything under `data/interim/` and `data/processed/` is generated — never
-commit it, and never hand-edit it.
+commit it, and never hand-edit it. Inside the Docker stack these two stages are
+**named volumes**, not host directories: the pipeline rewrites the same fixed
+paths on every run, and doing that across a macOS bind mount trips a Docker
+Desktop/VirtioFS bug (`docs/virtiofs_errno35_deadlock.md`). Use `make
+data-export` to copy the generated parquets back to the host, and `make
+data-import` to push host copies in. `data/raw/` is unaffected — it stays
+bind-mounted, so dropping the two CSVs there is all the setup it needs.
 
 ### Reproducing the training pipeline
 
@@ -106,13 +112,19 @@ Open the Airflow UI, find **`ampops_training_pipeline`**, and trigger it with th
 ```
 ingest_raw → validate_raw → clean_and_join → validate_joined
   → build_features → split_train_test
-  → train[linear | random_forest | xgboost]   (dynamically mapped)
-  → choose_champion → register
+  → run_automl → register → evaluate_test
 ```
 
-On success you'll have `data/processed/{joined_hourly,features,train,test}.parquet`
-on the host, three runs in MLflow, and `ampops-demand-forecaster` registered with
-the `@champion` alias.
+`run_automl` runs an H2O AutoML search (up to `AUTOML_MAX_MODELS` candidates,
+bounded by `AUTOML_MAX_RUNTIME_SECS`) and hands its leader to `register`, which
+promotes it to `@champion`; `evaluate_test` then reloads that exact registered
+version and scores it against the sealed test holdout, tagging the result. On
+success you'll have `{joined_hourly,features,train,test}.parquet` in the
+`ampops-data-processed` volume (`make data-export` copies them to
+`data/processed/` on the host), an MLflow run per model H2O trained, and
+`ampops-demand-forecaster` registered with the `@champion` alias plus
+validation and test metrics. See `docs/automl_implementation.md` for how the
+search works and how to run it locally (it needs a local JVM outside Docker).
 
 Or trigger the same run from the command line:
 
@@ -169,10 +181,10 @@ make test    # pytest
 ampops/
 ├── dags/               # Airflow DAG (orchestration only, no business logic)
 ├── src/ampops/         # the pipeline package
-│   ├── config.py       # paths, constants, model configs — single source of truth
+│   ├── config.py       # paths, constants, AutoML settings — single source of truth
 │   ├── data/           # ingest, clean (DST realignment), join, validate
 │   ├── features/       # calendar + lag feature engineering, chronological split
-│   ├── training/       # model bake-off, champion selection, registry promotion
+│   ├── training/       # H2O AutoML search, registry promotion
 │   └── utils/          # parquet IO, logging
 ├── scripts/            # run_pipeline_local.py
 ├── notebooks/          # 01_join_and_eda.ipynb (EDA deliverable)
