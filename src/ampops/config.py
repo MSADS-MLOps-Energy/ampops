@@ -127,7 +127,7 @@ MODEL_CONFIGS = [
             "n_estimators": 200,
             "max_depth": 16,
             "min_samples_leaf": 5,
-            "n_jobs": -1,
+            "n_jobs": 2,
             "random_state": RANDOM_SEED,
         },
     },
@@ -139,7 +139,9 @@ MODEL_CONFIGS = [
             "learning_rate": 0.05,
             "subsample": 0.8,
             "colsample_bytree": 0.8,
-            "n_jobs": -1,
+            # n_jobs=1 avoids OpenMP segfaults on macOS when sklearn RF
+            # (n_jobs=-1) has already spun up threads in the same process.
+            "n_jobs": 1,
             "random_state": RANDOM_SEED,
         },
     },

@@ -26,4 +26,4 @@ holidays==0.47
 # 2.16.2 is the floor that works here: Airflow 2.9.3's constraints pin
 # pyarrow==16.1.0, and every mlflow before 2.16 caps pyarrow<16. Keep this in
 # sync with the mlflow server image tag in docker-compose.yml.
-mlflow==2.16.2
+mlflow[databricks]==2.16.2

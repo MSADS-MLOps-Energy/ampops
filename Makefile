@@ -1,5 +1,6 @@
 .PHONY: setup lint test run-api dvc-init docker-up docker-down \
-        airflow-up airflow-down airflow-logs airflow-reset dag-test pipeline-local
+        airflow-up airflow-down airflow-logs airflow-reset dag-test \
+        pipeline-local train
 
 # --- Local development ------------------------------------------------------
 
@@ -17,8 +18,15 @@ test:
 
 # Run the data stages outside Airflow — the fastest way to check a change to
 # the ampops package without waiting on the scheduler.
+# Uses the active interpreter (conda activate ampops, or .venv after make setup).
 pipeline-local:
-	. .venv/bin/activate && python scripts/run_pipeline_local.py
+	python scripts/run_pipeline_local.py
+
+# Bake-off + optional registry + sealed test holdout. Logs eval_name, metrics,
+# and duration to whatever MLFLOW_TRACKING_URI points at (Databricks when
+# MLFLOW_TRACKING_URI=databricks in .env). Requires `make pipeline-local` first.
+train:
+	python scripts/run_training.py
 
 # --- Airflow stack ----------------------------------------------------------
 

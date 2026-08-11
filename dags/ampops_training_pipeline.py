@@ -3,7 +3,7 @@
     ingest_raw -> validate_raw -> clean_and_join -> validate_joined
         -> build_features -> split_train_test
         -> train[linear | random_forest | xgboost]   (dynamically mapped)
-        -> select_champion -> register_champion
+        -> select_champion -> register_champion -> score_holdout
 
 This module is orchestration only: every task body is a thin call into the
 `ampops` package under src/. That separation is deliberate — the business logic
@@ -24,6 +24,7 @@ from ampops.data import clean, ingest, join, validate
 from ampops.features.build import build_features as build_features_fn
 from ampops.features.split import time_split
 from ampops.training.bakeoff import train_candidate
+from ampops.training.evaluate import evaluate_holdout
 from ampops.training.registry import register_champion, select_champion
 from ampops.utils.io import read_parquet, write_parquet
 
@@ -138,6 +139,11 @@ def ampops_training_pipeline():
         """Promote the champion into the MLflow Model Registry as @champion."""
         return register_champion(champion)
 
+    @task
+    def score_holdout(champion: dict, test_path: str) -> dict:
+        """Sealed test eval — logged as its own MLflow run (eval_name=test_holdout)."""
+        return evaluate_holdout(champion, test_path=test_path)
+
     raw = ingest_raw()
     validated_raw = validate_raw(raw)
     joined_paths = clean_and_join(validated_raw)
@@ -151,7 +157,9 @@ def ampops_training_pipeline():
         model_config=config.MODEL_CONFIGS
     )
 
-    register(choose_champion(results))
+    champion = choose_champion(results)
+    register(champion)
+    score_holdout(champion, splits["test"])
 
 
 ampops_training_pipeline()

@@ -8,6 +8,7 @@ file, not the DAG.
 
 from __future__ import annotations
 
+import os
 from typing import Any
 
 import mlflow
@@ -17,6 +18,27 @@ from ampops import config
 from ampops.utils.io import get_logger
 
 logger = get_logger(__name__)
+
+
+def _configure_tracking(tracking_uri: str | None = None) -> None:
+    tracking_uri = tracking_uri or config.MLFLOW_TRACKING_URI
+    mlflow.set_tracking_uri(tracking_uri)
+    # Databricks workspaces often disable the legacy workspace registry; UC is
+    # the default. Callers should pass a 3-level name: catalog.schema.model.
+    if tracking_uri == "databricks" or tracking_uri.startswith("databricks://"):
+        registry_uri = os.getenv("MLFLOW_REGISTRY_URI", "databricks-uc")
+        mlflow.set_registry_uri(registry_uri)
+
+
+def _resolve_model_name(model_name: str) -> str:
+    """Ensure Databricks Unity Catalog gets a three-level model name."""
+    if model_name.count(".") >= 2:
+        return model_name
+    prefix = os.getenv("AMPOPS_UC_MODEL_PREFIX", "main.default")
+    safe = model_name.replace("-", "_")
+    resolved = f"{prefix}.{safe}"
+    logger.info("Expanded model name %r -> %r for Unity Catalog", model_name, resolved)
+    return resolved
 
 
 def select_champion(results: list[dict[str, Any]]) -> dict[str, Any]:
@@ -46,8 +68,8 @@ def register_champion(
     a `semantic_version` of `1.<version>.0` plus the metrics it won on, so the
     registry entry is self-describing for the deployment workstream.
     """
-    model_name = model_name or config.REGISTERED_MODEL_NAME
-    mlflow.set_tracking_uri(tracking_uri or config.MLFLOW_TRACKING_URI)
+    model_name = _resolve_model_name(model_name or config.REGISTERED_MODEL_NAME)
+    _configure_tracking(tracking_uri)
 
     model_uri = f"runs:/{champion['run_id']}/model"
     version = mlflow.register_model(model_uri=model_uri, name=model_name)
