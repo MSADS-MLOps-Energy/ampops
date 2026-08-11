@@ -295,14 +295,15 @@ Homebrew installed it — this is the most common local setup snag.
   rule out session-accumulated state). Both times it failed at `clean_and_join`
   writing `joined_hourly.parquet` with `OSError: [Errno 35] Resource deadlock
   avoided` — the same error class as an earlier session's failure reading the
-  weather CSV at `ingest_raw`. **This is an open, unresolved Docker
-  Desktop/VirtioFS bug, not an AutoML or pipeline-code defect** — full
-  root-cause investigation, evidence, and recommended fixes are in
-  **`docs/virtiofs_errno35_deadlock.md`**; that document also corrects an
-  earlier (incorrect) "Spotlight indexer" theory from a prior session. In
-  short: a per-inode VirtioFS lock-state bug in Docker Desktop's own VM
-  process, worked around (not fixed) this session by copying the affected
-  files to fresh inodes from the host side.
+  weather CSV at `ingest_raw`. **This was a Docker Desktop/VirtioFS bug, not an
+  AutoML or pipeline-code defect** — a per-inode lock-state bug in Docker
+  Desktop's own VM process. Full root-cause investigation, evidence, and the
+  fix are in **`docs/virtiofs_errno35_deadlock.md`**; that document also
+  corrects an earlier (incorrect) "Spotlight indexer" theory from a prior
+  session. **Since resolved**: `data/interim`, `data/processed` and `logs/` were
+  moved from host bind mounts onto named Docker volumes, and the DAG now
+  completes end-to-end (see that doc's "Applied fix"). The notes below describe
+  the manual fresh-inode workaround used before that fix landed.
 - **Live validation, real data, registered for real**: with that workaround,
   ran `automl.run_h2o_automl()` → `registry.register_champion()` →
   `automl.evaluate_on_test()` → `registry.tag_test_metrics()` directly

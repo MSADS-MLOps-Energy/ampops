@@ -1,5 +1,6 @@
 .PHONY: setup lint test run-api dvc-init docker-up docker-down \
-        airflow-up airflow-down airflow-logs airflow-reset dag-test pipeline-local
+        airflow-up airflow-down airflow-logs airflow-reset dag-test pipeline-local \
+        data-export data-import
 
 # --- Local development ------------------------------------------------------
 
@@ -30,12 +31,34 @@ airflow-up:
 airflow-down:
 	docker compose down
 
-# Wipes the Airflow metadata DB and all MLflow runs. Destructive.
+# Wipes the Airflow metadata DB, all MLflow runs, every task log, and the
+# generated parquets in data/interim + data/processed (all named volumes now).
+# Destructive. Raw CSVs survive — data/raw is a host bind mount.
 airflow-reset:
 	docker compose down -v
 
 airflow-logs:
 	docker compose logs -f airflow-scheduler
+
+# --- Moving data in and out of the volumes -----------------------------------
+#
+# data/interim and data/processed live in named volumes rather than on the host,
+# to keep the DAG's fixed rewrite paths off the VirtioFS bind mount (see
+# docs/virtiofs_errno35_deadlock.md). These targets move files across that
+# boundary with `docker compose cp`, which streams over the Docker API and never
+# touches VirtioFS. data/raw needs no such step — it is still bind-mounted.
+
+# Pull the generated parquets out for notebooks and inspection.
+# Overwrites whatever is in ./data/processed on the host.
+data-export:
+	docker compose cp airflow-scheduler:/opt/airflow/data/processed/. ./data/processed/
+	@echo "Exported -> ./data/processed"
+
+# Push host parquets in — e.g. to run the training tasks against an existing
+# train.parquet without re-running the data stages first.
+data-import:
+	docker compose cp ./data/processed/. airflow-scheduler:/opt/airflow/data/processed/
+	@echo "Imported -> ampops-data-processed volume"
 
 # Trigger a real run through the scheduler. This is what the ▶ button in the
 # UI does, and the right way to produce a run for the demo.

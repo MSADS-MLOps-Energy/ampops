@@ -32,8 +32,19 @@ x-airflow-common: &airflow-common
   volumes:
     - ./dags:/opt/airflow/dags
     - ./src:/opt/airflow/src
-    - ./data:/opt/airflow/data
-    - ./logs:/opt/airflow/logs
+    # data/raw stays a host bind mount (read-only) so the two raw CSVs remain
+    # drop-in from the host per README "Getting the data". Nothing writes here.
+    - ./data/raw:/opt/airflow/data/raw:ro
+    # interim/, processed/ and logs/ are named volumes, not bind mounts. Every
+    # DAG run rewrites the same fixed paths under them, and that access pattern
+    # triggers a per-inode VirtioFS lock bug on macOS that fails ordinary reads
+    # and writes with `OSError: [Errno 35] Resource deadlock avoided` — see
+    # docs/virtiofs_errno35_deadlock.md. Named volumes live inside the Linux VM
+    # and never cross the host-guest bridge, so the bug cannot reach them.
+    # Use `make data-export` / `make data-import` to move files across.
+    - ampops-data-interim:/opt/airflow/data/interim
+    - ampops-data-processed:/opt/airflow/data/processed
+    - ampops-logs:/opt/airflow/logs
     - ./plugins:/opt/airflow/plugins
   user: "${AIRFLOW_UID:-50000}:0"
   depends_on:
@@ -184,3 +195,8 @@ volumes:
   mlflow-data:
   postgres-data:
   grafana-data:
+  # Pipeline working storage, deliberately off the host bind mount — see the
+  # comment on x-airflow-common.volumes above.
+  ampops-data-interim:
+  ampops-data-processed:
+  ampops-logs:
