@@ -31,20 +31,23 @@ Upstream Raw Data Ingestion (PJM Grid + Open-Meteo Weather API)
    2. Airflow DAG or local scripts       (orchestration)
               │
               ▼
-   3. MLflow bake-off + holdout          (Databricks or local tracking)
+   3. H2O AutoML search + MLflow         (Databricks or local tracking)
               │
               ▼
    4. Model Registry (@champion)         (Unity Catalog when configured)
               │
               ▼
-   5. FastAPI + monitoring               (deployment / Week 3)
+   5. FastAPI + daily forecast DAG       (implemented)
+              │
+              ▼
+   6. Monitoring / drift / retrain       (stub)
 ```
 
 **Pipeline stages (implemented):**
 
 1. **Data Ingestion & Features** — Raw CSVs in `data/raw/` are cleaned (DST realignment, dedup), joined, and feature-engineered (calendar + horizon-safe lags). Chronological split: final **12 months** sealed as `test.parquet`.
-2. **Bake-off & Experiment Tracking** — Airflow (or `make train`) trains **linear → random forest → XGBoost**, logs each as an MLflow run (`eval_name=validation_tail`), picks the lowest-MAPE champion, then scores the sealed holdout (`eval_name=test_holdout`). Tracking can target **Databricks MLflow** or a local compose MLflow server.
-3. **Registry** — Champion promotion to `models:/…@champion` (Databricks Unity Catalog when a catalog is configured; soft-fails otherwise so training/holdout still complete).
+2. **AutoML & Experiment Tracking** — Airflow (or `make train`) runs an **H2O AutoML** search over algorithms and hyperparameters, logs the leader to MLflow, and scores it on a validation tail. Selection uses `nfolds=0` with an explicit `validation_frame` rather than k-fold, because k-fold would shuffle time-ordered rows and leak future information. Tracking can target **Databricks MLflow** or a local compose MLflow server. Requires Java — see Prerequisites.
+3. **Registry & Holdout** — Champion promotion to `models:/…@champion` (Databricks Unity Catalog when a catalog is configured; soft-fails to a `runs:/` URI otherwise so training still completes), followed by a post-registration evaluation against the sealed test set, tagged onto the registered version.
 4. **Serving** — FastAPI + H2O inference behind a Redis-backed forecast cache and feature store, orchestrated by a daily forecast DAG that precomputes the next operating day and persists to Postgres. Implemented and validated end-to-end in the local Docker stack — see [Serving](#serving) below. Monitoring (Evidently drift detection, actuals-vs-prediction scoring, retrain webhook) is still a stub under `monitoring/`.
 
 Full Databricks wiring notes: [`docs/databricks_experiment_tracking.md`](docs/databricks_experiment_tracking.md). Full serving write-up: [`docs/fastapi_serving_layer.md`](docs/fastapi_serving_layer.md); binding serving spec: [`docs/serving_contract.md`](docs/serving_contract.md).
@@ -53,20 +56,21 @@ Full Databricks wiring notes: [`docs/databricks_experiment_tracking.md`](docs/da
 
 | Split | Purpose | Primary metric |
 |---|---|---|
-| Validation tail (last 3 months of **train**) | Model selection in the bake-off | **MAPE** (RMSE, MAE secondary) |
-| Sealed test (final 12 months) | Holdout after champion selection | **MAPE** |
+| Validation tail (last 3 months of **train**) | AutoML leader selection | **MAPE** (RMSE, MAE secondary) |
+| Sealed test (final 12 months) | Holdout scored after registration | **MAPE** |
 
-Each MLflow run also logs hyperparameters (`n_estimators`, … plus `hp.*` copies and a `hyperparams.json` artifact) and wall-clock timing so runs can be compared and re-executed.
+Each MLflow run also logs the leader's hyperparameters (`hp.*` params plus a `hyperparams.json` artifact) and wall-clock timing so runs can be compared and re-executed. Test-set metrics are written back onto the registered model version as `test_mape` / `test_rmse` / `test_mae` tags.
 
 ## Tech Stack
 
-`Python 3.11` · `XGBoost` · `scikit-learn` · `Airflow` · `MLflow` (+ Databricks) · `FastAPI` · `Docker` · `Evidently` (planned) · `Ruff` · `pytest`
+`Python 3.11` · `H2O AutoML` (Java 17) · `scikit-learn` · `Airflow` · `MLflow` (+ Databricks) · `FastAPI` · `Redis` · `Postgres` · `Prometheus` · `Docker` · `Evidently` (planned) · `Ruff` · `pytest`
 
 ## Getting Started
 
 ### Prerequisites
 
 - **Python 3.11** (conda env `ampops` or `make setup` → `.venv`)
+- **Java 17** — H2O spawns a JVM, so `make train` and the serving API both need it. macOS: `brew install openjdk@17` (keg-only; the Makefile adds it to `PATH` automatically). H2O 3.46.x supports Java 8–17 — **21 is not supported**.
 - Docker & Docker Compose (optional — for the full Airflow stack)
 - Databricks workspace + PAT (optional — for cloud experiment tracking)
 
@@ -77,12 +81,7 @@ Datasets are not committed to git. Place both files in `data/raw/` (filenames ma
 | File | Source | Notes |
 |---|---|---|
 | `COMED_hourly.csv` | [Kaggle: Hourly Energy Consumption](https://www.kaggle.com/datasets/robikscube/hourly-energy-consumption) | 66,497 rows, 2011-01-01 → 2018-08-03 |
-| `open-meteo-41.86N87.65W179m.csv` | Open-Meteo archive, or regenerate locally | Chicago 41.86N/−87.65W, hourly, 2010–2019, fixed UTC−5 |
-
-```bash
-# Optional: regenerate the weather file (writes the 3-line preamble ingest expects)
-python scripts/download_open_meteo.py
-```
+| `open-meteo-41.86N87.65W179m.csv` | [Open-Meteo archive](https://open-meteo.com/en/docs/historical-weather-api) | Chicago 41.86N/−87.65W, hourly, 2010–2019, fixed UTC−5. Keep the 3-line preamble — `ingest` skips exactly 3 rows. |
 
 Everything under `data/interim/` and `data/processed/` is generated — never commit it.
 
@@ -100,7 +99,7 @@ MLFLOW_EXPERIMENT=/Users/you@uchicago.edu/Ampops
 DATABRICKS_HOST=https://<workspace>.cloud.databricks.com
 DATABRICKS_TOKEN=<pat>
 MLFLOW_REGISTRY_URI=databricks-uc
-AMPOPS_MODEL_NAME=ampops_demand_forecaster
+AMPOPS_MODEL_NAME=ampops-demand-forecaster
 # AMPOPS_UC_MODEL_PREFIX=catalog.schema   # if your UC catalog is not main.default
 ```
 
@@ -113,17 +112,18 @@ conda activate ampops          # or: make setup && source .venv/bin/activate
 set -a && source .env && set +a
 
 make pipeline-local            # ingest → join → features → train/test split
-make train                     # bake-off → register (best-effort) → sealed holdout
+make train                     # H2O AutoML → register (best-effort) → sealed holdout
 ```
 
 Useful variants:
 
 ```bash
-python scripts/run_training.py --models xgboost
-python scripts/run_training.py --skip-register
-python scripts/run_training.py --from-run <run_id> --skip-register
-python scripts/run_training.py --models xgboost --param n_estimators=300
+python scripts/run_training.py --skip-register          # search + score, no registry write
+python scripts/run_training.py --skip-holdout           # stop after registration
+python scripts/run_training.py --train-path <path> --test-path <path>
 ```
+
+Search budget is env-driven rather than per-flag: `AMPOPS_AUTOML_MAX_RUNTIME_SECS` (default 300) and `AMPOPS_AUTOML_MAX_MODELS` (default 10).
 
 ### Airflow stack (Docker)
 
@@ -148,8 +148,7 @@ DAG shape:
 ```
 ingest_raw → validate_raw → clean_and_join → validate_joined
   → build_features → split_train_test
-  → train[linear | random_forest | xgboost]   (dynamically mapped)
-  → choose_champion → register → score_holdout
+  → run_automl → register → evaluate_test
 ```
 
 `make dag-test` runs the DAG in one process (stops the scheduler first to avoid duplicate task execution).
@@ -216,10 +215,10 @@ ampops/
 │   ├── ampops_training_pipeline.py   # ingest -> ... -> register -> evaluate_test
 │   └── ampops_daily_forecast.py      # resolve_horizon -> request_forecast -> persist -> verify_cached
 ├── src/ampops/
-│   ├── config.py              # paths, MODEL_CONFIGS, metrics
+│   ├── config.py              # paths, data contract, AutoML + MLflow settings
 │   ├── data/                  # ingest, clean (DST), join, validate
 │   ├── features/              # calendar + lag features, time split
-│   ├── training/              # bake-off, holdout eval, registry, pipeline
+│   ├── training/              # automl (search + test eval), registry, shared metrics
 │   └── utils/
 ├── app/                        # FastAPI serving layer (implemented)
 │   ├── main.py                 # endpoints, lifespan (H2O cluster start/stop)
@@ -232,14 +231,15 @@ ampops/
 │   └── prometheus.yml           # scrape config for the api service
 ├── scripts/
 │   ├── run_pipeline_local.py  # data stages without Airflow
-│   ├── run_training.py        # bake-off + holdout CLI (make train)
-│   ├── seed_redis.py           # load joined_hourly.parquet into the Redis feature store
-│   └── download_open_meteo.py
+│   ├── run_training.py        # AutoML + holdout CLI (make train)
+│   └── seed_redis.py           # load joined_hourly.parquet into the Redis feature store
 ├── notebooks/                 # EDA
 ├── tests/
 ├── docs/
 │   ├── AmpOps_Project_Context.md
 │   ├── timezone_alignment_finding.md
+│   ├── data_cleaning_plan.md
+│   ├── automl_implementation.md
 │   ├── databricks_experiment_tracking.md
 │   ├── serving_contract.md            # binding serving spec
 │   ├── fastapi_serving_layer.md       # serving architecture + lifecycle + traps
@@ -266,7 +266,7 @@ explain this and both predict the same shift (PJM publishes every zone on
 Eastern time, and/or the stamps are hour-ending), so they need not be
 adjudicated. The evidence: summer load-vs-temperature coupling peaks at −1h
 (0.7925 vs 0.7497 uncorrected), and adopting the correction improved *every*
-model in the bake-off. Full write-up in `docs/timezone_alignment_finding.md`.
+model in the then-current bake-off (since replaced by the AutoML search). Full write-up in `docs/timezone_alignment_finding.md`.
 
 `validate.check_dst_alignment` guards the transformation on every run by
 comparing hour-of-day load profiles against an uncorrected control. Worth
