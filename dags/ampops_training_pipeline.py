@@ -2,8 +2,8 @@
 
     ingest_raw -> validate_raw -> clean_and_join -> validate_joined
         -> build_features -> split_train_test
-        -> train[linear | random_forest | xgboost]   (dynamically mapped)
-        -> select_champion -> register_champion -> score_holdout
+        -> run_automl (H2O AutoML search over algorithms + hyperparameters)
+        -> register_champion -> evaluate_test
 
 This module is orchestration only: every task body is a thin call into the
 `ampops` package under src/. That separation is deliberate — the business logic
@@ -23,9 +23,7 @@ from ampops import config
 from ampops.data import clean, ingest, join, validate
 from ampops.features.build import build_features as build_features_fn
 from ampops.features.split import time_split
-from ampops.training.bakeoff import train_candidate
-from ampops.training.evaluate import evaluate_holdout
-from ampops.training.registry import register_champion, select_champion
+from ampops.training import automl, registry
 from ampops.utils.io import read_parquet, write_parquet
 
 NAIVE_JOIN_PARQUET = config.INTERIM_DIR / "naive_join.parquet"
@@ -39,7 +37,7 @@ DEFAULT_ARGS = {
 
 @dag(
     dag_id="ampops_training_pipeline",
-    description="Clean, join, feature-engineer, bake off, and register the demand forecaster",
+    description="Clean, join, feature-engineer, AutoML search, register, and test-evaluate the demand forecaster",
     # Manual trigger for the demo. Switch to "@daily" for a scheduled retrain.
     schedule=None,
     start_date=pendulum.datetime(2025, 8, 1, tz="UTC"),
@@ -121,28 +119,26 @@ def ampops_training_pipeline():
         }
 
     @task
-    def train(model_config: dict, train_path: str) -> dict:
-        """One bake-off candidate. Mapped over config.MODEL_CONFIGS."""
-        return train_candidate(
-            train_path=train_path,
-            model_name=model_config["model_name"],
-            params=model_config["params"],
-        )
-
-    @task
-    def choose_champion(results: list[dict]) -> dict:
-        """Lowest validation MAPE wins."""
-        return select_champion(results)
+    def run_automl(train_path: str) -> dict:
+        """H2O AutoML search over algorithms + hyperparameters; returns the leader's scorecard."""
+        return automl.run_h2o_automl(train_path)
 
     @task
     def register(champion: dict) -> dict:
         """Promote the champion into the MLflow Model Registry as @champion."""
-        return register_champion(champion)
+        return registry.register_champion(champion)
 
     @task
-    def score_holdout(champion: dict, test_path: str) -> dict:
-        """Sealed test eval — logged as its own MLflow run (eval_name=test_holdout)."""
-        return evaluate_holdout(champion, test_path=test_path)
+    def evaluate_test(registration: dict, test_path: str) -> dict:
+        """Score the sealed test holdout using the registration's model_uri.
+
+        Prefer the registry URI when promotion succeeded; otherwise fall back to
+        `runs:/<run_id>/model` (Databricks soft-fail path). Selection never uses
+        this holdout.
+        """
+        model_uri = registration["model_uri"]
+        metrics = automl.evaluate_on_test(model_uri, test_path)
+        return registry.tag_test_metrics(registration, metrics)
 
     raw = ingest_raw()
     validated_raw = validate_raw(raw)
@@ -151,15 +147,7 @@ def ampops_training_pipeline():
     features_path = build_features(joined_path)
     splits = split_train_test(features_path)
 
-    # Dynamic task mapping: one task instance per entry in MODEL_CONFIGS.
-    # Adding a fourth algorithm needs no change to this file.
-    results = train.partial(train_path=splits["train"]).expand(
-        model_config=config.MODEL_CONFIGS
-    )
-
-    champion = choose_champion(results)
-    register(champion)
-    score_holdout(champion, splits["test"])
+    evaluate_test(register(run_automl(splits["train"])), splits["test"])
 
 
 ampops_training_pipeline()

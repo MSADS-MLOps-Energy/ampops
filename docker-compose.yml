@@ -23,10 +23,15 @@ x-airflow-common: &airflow-common
     PYTHONPATH: /opt/airflow/src
     # Absolute paths so ampops.config resolves the same way in every container.
     AMPOPS_DATA_DIR: /opt/airflow/data
-    MLFLOW_TRACKING_URI: ${MLFLOW_TRACKING_URI:-http://mlflow:5000}
+    # Databricks is the default tracking backend when .env sets these.
+    # Override with MLFLOW_TRACKING_URI=http://mlflow:5000 for compose-local MLflow.
+    MLFLOW_TRACKING_URI: ${MLFLOW_TRACKING_URI:-databricks}
     MLFLOW_EXPERIMENT: ${MLFLOW_EXPERIMENT:-ampops-demand-forecasting}
+    MLFLOW_REGISTRY_URI: ${MLFLOW_REGISTRY_URI:-databricks-uc}
     DATABRICKS_HOST: ${DATABRICKS_HOST:-}
     DATABRICKS_TOKEN: ${DATABRICKS_TOKEN:-}
+    AMPOPS_MODEL_NAME: ${AMPOPS_MODEL_NAME:-ampops-demand-forecaster}
+    AMPOPS_UC_MODEL_PREFIX: ${AMPOPS_UC_MODEL_PREFIX:-}
     # The Airflow image has no git binary, so MLflow cannot stamp a source Git
     # SHA. Harmless, but GitPython otherwise dumps a 15-line "Bad git
     # executable" block into every training task log.
@@ -34,8 +39,19 @@ x-airflow-common: &airflow-common
   volumes:
     - ./dags:/opt/airflow/dags
     - ./src:/opt/airflow/src
-    - ./data:/opt/airflow/data
-    - ./logs:/opt/airflow/logs
+    # data/raw stays a host bind mount (read-only) so the two raw CSVs remain
+    # drop-in from the host per README "Getting the data". Nothing writes here.
+    - ./data/raw:/opt/airflow/data/raw:ro
+    # interim/, processed/ and logs/ are named volumes, not bind mounts. Every
+    # DAG run rewrites the same fixed paths under them, and that access pattern
+    # triggers a per-inode VirtioFS lock bug on macOS that fails ordinary reads
+    # and writes with `OSError: [Errno 35] Resource deadlock avoided` — see
+    # docs/virtiofs_errno35_deadlock.md. Named volumes live inside the Linux VM
+    # and never cross the host-guest bridge, so the bug cannot reach them.
+    # Use `make data-export` / `make data-import` to move files across.
+    - ampops-data-interim:/opt/airflow/data/interim
+    - ampops-data-processed:/opt/airflow/data/processed
+    - ampops-logs:/opt/airflow/logs
     - ./plugins:/opt/airflow/plugins
   user: "${AIRFLOW_UID:-50000}:0"
   depends_on:
@@ -186,3 +202,8 @@ volumes:
   mlflow-data:
   postgres-data:
   grafana-data:
+  # Pipeline working storage, deliberately off the host bind mount — see the
+  # comment on x-airflow-common.volumes above.
+  ampops-data-interim:
+  ampops-data-processed:
+  ampops-logs:

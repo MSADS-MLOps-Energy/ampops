@@ -7,16 +7,19 @@ holidays  # US/IL holiday flag in ampops.features.build
 torch
 
 # --- Pipeline orchestration ---
-apache-airflow
+apache-airflow==2.9.3
+# prefect  # swap in if using Prefect instead of Airflow
 
 # --- Data versioning ---
 dvc
 dvc-s3  # or dvc-gs / dvc-azure depending on remote storage
 
 # --- Experiment tracking & registry ---
-# Unpinned for local Python 3.13; Airflow image keeps mlflow==2.16.2 in
-# requirements-airflow.txt. mlflow 3.x talks to Databricks the same way.
+# Databricks tracking needs the databricks extra (auth via DATABRICKS_* env).
 mlflow[databricks]
+# H2O AutoML (host-side `make train`). Airflow image pins this in
+# requirements-airflow.txt; keep versions in sync when bumping.
+h2o==3.46.0.11
 
 # --- Serving ---
 fastapi

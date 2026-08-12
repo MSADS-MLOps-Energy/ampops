@@ -1,4 +1,4 @@
-"""Single source of truth for paths, constants, and model configs.
+"""Single source of truth for paths, constants, and training config.
 
 Paths are env-driven so the same code runs in three places without edits:
   - a notebook (cwd = notebooks/)
@@ -108,44 +108,36 @@ TEST_MONTHS = 12
 
 # --- Training ---------------------------------------------------------------
 
-MLFLOW_TRACKING_URI = os.getenv("MLFLOW_TRACKING_URI", "http://localhost:5000")
+# Default tracking is Databricks MLflow (`MLFLOW_TRACKING_URI=databricks` plus
+# DATABRICKS_HOST / DATABRICKS_TOKEN). Local compose MLflow remains available
+# by setting MLFLOW_TRACKING_URI=http://mlflow:5000 (in Docker) or
+# http://localhost:5050 (host).
+MLFLOW_TRACKING_URI = os.getenv("MLFLOW_TRACKING_URI", "databricks")
 MLFLOW_EXPERIMENT = os.getenv("MLFLOW_EXPERIMENT", "ampops-demand-forecasting")
+MLFLOW_REGISTRY_URI = os.getenv("MLFLOW_REGISTRY_URI", "databricks-uc")
 REGISTERED_MODEL_NAME = os.getenv("AMPOPS_MODEL_NAME", "ampops-demand-forecaster")
+# When the registered name is not already `catalog.schema.model`, prefix it.
+# Leave empty if using workspace registry or a fully-qualified AMPOPS_MODEL_NAME.
+UC_MODEL_PREFIX = os.getenv("AMPOPS_UC_MODEL_PREFIX", "").strip()
+
+
+def resolve_registered_model_name(name: str | None = None) -> str:
+    """Return a registry model name, applying AMPOPS_UC_MODEL_PREFIX if needed."""
+    resolved = name or REGISTERED_MODEL_NAME
+    if resolved.count(".") >= 2:
+        return resolved
+    if UC_MODEL_PREFIX:
+        return f"{UC_MODEL_PREFIX}.{resolved}"
+    return resolved
+
 
 RANDOM_SEED = 42
 
-# The "AutoML" requirement is satisfied by this explicit bake-off: each entry
-# becomes one dynamically-mapped Airflow task and one MLflow run.
-MODEL_CONFIGS = [
-    {
-        "model_name": "linear",
-        "params": {},
-    },
-    {
-        "model_name": "random_forest",
-        "params": {
-            "n_estimators": 200,
-            "max_depth": 16,
-            "min_samples_leaf": 5,
-            "n_jobs": 2,
-            "random_state": RANDOM_SEED,
-        },
-    },
-    {
-        "model_name": "xgboost",
-        "params": {
-            "n_estimators": 600,
-            "max_depth": 8,
-            "learning_rate": 0.05,
-            "subsample": 0.8,
-            "colsample_bytree": 0.8,
-            # n_jobs=1 avoids OpenMP segfaults on macOS when sklearn RF
-            # (n_jobs=-1) has already spun up threads in the same process.
-            "n_jobs": 1,
-            "random_state": RANDOM_SEED,
-        },
-    },
-]
+# H2O AutoML search budget. These constants also govern smoke/CI runs (not
+# just full retrains), so keep the defaults to "a few minutes," not "as good
+# as possible" — override with the env vars for a deeper search on demand.
+AUTOML_MAX_RUNTIME_SECS = int(os.getenv("AMPOPS_AUTOML_MAX_RUNTIME_SECS", "300"))
+AUTOML_MAX_MODELS = int(os.getenv("AMPOPS_AUTOML_MAX_MODELS", "10"))
 
 # MAPE is the headline metric (scale-free, easy to justify); RMSE is the
 # secondary check because demand spikes are the failure mode that matters.

@@ -49,7 +49,7 @@ The weather export's metadata row (`utc_offset_seconds=-18000`, `timezone_abbrev
 | Train/test split | **Time-based split, not random** — e.g., train on all but the final 2–3 months, test on the tail, consistent with the course's requirement that the test set stay isolated until production validation | Random splits leak future information into training for time series; a real demand-forecasting deployment only ever has the past to work with |
 | Feature engineering | Calendar features (hour-of-day, day-of-week, month, holiday flag), lag features (t-24h, t-168h), rolling means, and the weather features already present | Non-linear demand-weather coupling is explicitly the framing of this project — calendar effects (weekday/weekend, season) usually explain as much variance as weather alone in load forecasting |
 | Model family | Gradient-boosted trees (XGBoost or LightGBM) as the primary candidate, linear regression as a baseline for comparison | Handles non-linear feature interactions well, trains fast (important for a 3-week timeline and repeated retraining during pipeline debugging), and is easy to log/version with MLflow |
-| "AutoML" requirement | Satisfy it with a **small, explicit model bake-off** (Linear → RandomForest → XGBoost/LightGBM) logged as separate MLflow runs, rather than standing up a full AutoML framework | The course lists AutoML as an example ("e.g."), not a hard requirement — a clean bake-off with tracked metrics meets the spirit (comparing algorithms) with far less setup risk in the available time |
+| "AutoML" requirement | Satisfy it with a **small, explicit model bake-off** (Linear → RandomForest → XGBoost/LightGBM) logged as separate MLflow runs, rather than standing up a full AutoML framework | The course lists AutoML as an example ("e.g."), not a hard requirement — a clean bake-off with tracked metrics meets the spirit (comparing algorithms) with far less setup risk in the available time. **Superseded:** §9's separate "Set up AutoML for model building" deliverable turned out to require real AutoML, not just the bake-off; the bake-off was replaced with genuine H2O AutoML — see `docs/automl_implementation.md`. |
 
 ---
 
@@ -140,7 +140,7 @@ Deliverable:
 ### Week 2: 
 * Set up Airflow pipeline - will perform each of these steps (Databricks) **Miguel**
 * Set up MLFlow for experimentation (Databricks) **Collin**
-* Set up AutoML for model building (Databricks) --> Model Build **Sachin**
+* Set up AutoML for model building (Databricks) --> Model Build **Sachin** — *delivered as H2O AutoML instead of Databricks; see `docs/automl_implementation.md` for why Databricks Free Edition was ruled out*
 
 Deliverable:
 1. Data Preprocessing Pipeline Implemented in AirFlow

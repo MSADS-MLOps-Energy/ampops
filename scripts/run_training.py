@@ -1,26 +1,16 @@
 #!/usr/bin/env python
-"""Run the AmpOps bake-off + holdout eval against the configured MLflow backend.
+"""Run H2O AutoML → (best-effort) register → sealed test eval → Databricks MLflow.
 
-With `.env` pointing at Databricks (from the repo root):
+Training still runs on the host (or in Airflow); Databricks is the MLflow
+tracking/registry backend. Databricks AutoML is not used — see
+`docs/automl_implementation.md` and `docs/databricks_experiment_tracking.md`.
+
+Requires Java 8–17 on PATH (Homebrew `openjdk@17` is auto-detected) and `h2o`.
 
     conda activate ampops
-    set -a && source .env && set +a
-    make pipeline-local
+    # .env should set MLFLOW_TRACKING_URI=databricks + DATABRICKS_HOST/TOKEN
+    make pipeline-local   # or: make data-export after a DAG run
     make train
-
-Or:
-
-    python scripts/run_training.py
-    python scripts/run_training.py --skip-register
-    python scripts/run_training.py --models xgboost
-
-Re-run exact hyperparameters from a prior MLflow / Databricks run:
-
-    python scripts/run_training.py --from-run <run_id> --skip-register
-
-Override individual knobs on top of config (or --from-run):
-
-    python scripts/run_training.py --models xgboost --param n_estimators=300 --param max_depth=6
 """
 
 from __future__ import annotations
@@ -41,11 +31,10 @@ except ImportError:
     pass
 
 from ampops import config  # noqa: E402
-from ampops.training.bakeoff import (  # noqa: E402
-    load_config_from_run,
-    parse_param_overrides,
-)
-from ampops.training.pipeline import run_experiment_pipeline  # noqa: E402
+from ampops.training import automl, registry  # noqa: E402
+from ampops.utils.io import get_logger  # noqa: E402
+
+logger = get_logger(__name__)
 
 
 def main(argv: list[str] | None = None) -> None:
@@ -61,24 +50,6 @@ def main(argv: list[str] | None = None) -> None:
         help="Path to sealed test.parquet",
     )
     parser.add_argument(
-        "--models",
-        nargs="+",
-        choices=[c["model_name"] for c in config.MODEL_CONFIGS],
-        help="Subset of MODEL_CONFIGS to train (default: all)",
-    )
-    parser.add_argument(
-        "--from-run",
-        metavar="RUN_ID",
-        help="Re-train using hyperparameters logged on an existing MLflow run",
-    )
-    parser.add_argument(
-        "--param",
-        action="append",
-        default=[],
-        metavar="KEY=VALUE",
-        help="Override a hyperparameter (repeatable), e.g. --param n_estimators=300",
-    )
-    parser.add_argument(
         "--skip-register",
         action="store_true",
         help="Skip MLflow Model Registry promotion",
@@ -90,39 +61,45 @@ def main(argv: list[str] | None = None) -> None:
     )
     args = parser.parse_args(argv)
 
-    overrides = parse_param_overrides(args.param)
-    parent_run_id = None
+    train_path = Path(args.train_path)
+    if not train_path.exists():
+        raise SystemExit(
+            f"Missing {train_path}. Run `make pipeline-local` or "
+            "`make data-export` after a DAG run first."
+        )
 
-    if args.from_run:
-        loaded = load_config_from_run(args.from_run)
-        parent_run_id = loaded["source_run_id"]
-        params = {**loaded["params"], **overrides}
-        configs = [{"model_name": loaded["model_name"], "params": params}]
-    else:
-        configs = list(config.MODEL_CONFIGS)
-        if args.models:
-            wanted = set(args.models)
-            configs = [c for c in config.MODEL_CONFIGS if c["model_name"] in wanted]
-        if overrides:
-            configs = [
-                {
-                    "model_name": c["model_name"],
-                    "params": {**(c.get("params") or {}), **overrides},
-                }
-                for c in configs
-            ]
-
-    if parent_run_id:
-        for cfg in configs:
-            cfg["_parent_run_id"] = parent_run_id
-
-    summary = run_experiment_pipeline(
-        train_path=args.train_path,
-        test_path=args.test_path,
-        model_configs=configs,
-        register=not args.skip_register,
-        run_holdout=not args.skip_holdout,
+    logger.info(
+        "Tracking URI=%s experiment=%s",
+        config.MLFLOW_TRACKING_URI,
+        config.MLFLOW_EXPERIMENT,
     )
+
+    champion = automl.run_h2o_automl(str(train_path))
+    summary: dict = {"champion": champion}
+
+    registration: dict | None = None
+    if args.skip_register:
+        registration = {
+            "registered_model": None,
+            "version": None,
+            "run_id": champion["run_id"],
+            "algorithm": champion["model_name"],
+            "model_uri": f"runs:/{champion['run_id']}/model",
+            "skipped": True,
+        }
+        summary["registration"] = registration
+    else:
+        registration = registry.register_champion(champion)
+        summary["registration"] = registration
+
+    if not args.skip_holdout:
+        test_path = Path(args.test_path)
+        if not test_path.exists():
+            raise SystemExit(f"Missing {test_path}.")
+        assert registration is not None
+        metrics = automl.evaluate_on_test(registration["model_uri"], str(test_path))
+        summary["holdout"] = registry.tag_test_metrics(registration, metrics)
+
     print(json.dumps(summary, indent=2, default=str))
 
 
