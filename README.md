@@ -10,7 +10,9 @@ Predicting electricity demand before the grid has to guess.
 
 Modern electric grids operate under strict frequency balance requirements, and system operators must continuously adjust supply to meet volatile demand. Over-estimating demand forces grids to run expensive, carbon-intensive "peaker" plants; under-estimating demand risks frequency dropouts and blackouts.
 
-AmpOps automates the end-to-end machine learning lifecycle for short-term load forecasting: it ingests raw smart meter and weather telemetry, versions feature data, tracks challenger models, deploys low-latency containerized inference, and continuously monitors for sensor failure or data drift.
+AmpOps automates the end-to-end machine learning lifecycle for short-term load forecasting: it ingests raw smart meter and weather telemetry, versions feature data, tracks challenger models, serves day-ahead forecasts from a containerized FastAPI service, and continuously monitors for sensor failure or data drift.
+
+Serving latency is measured, not asserted: a scheduled daily batch precomputes the next operating day's 24 hourly forecasts, so cached reads return in roughly **1 ms**, while an on-demand prediction that misses the cache runs live H2O inference at roughly **300 ms** (a pandas frame has to cross into the JVM and back). Both numbers are from the local Docker stack — see `docs/serving_contract.md`.
 
 ## Data Sources
 
@@ -43,9 +45,9 @@ Upstream Raw Data Ingestion (PJM Grid + Open-Meteo Weather API)
 1. **Data Ingestion & Features** — Raw CSVs in `data/raw/` are cleaned (DST realignment, dedup), joined, and feature-engineered (calendar + horizon-safe lags). Chronological split: final **12 months** sealed as `test.parquet`.
 2. **Bake-off & Experiment Tracking** — Airflow (or `make train`) trains **linear → random forest → XGBoost**, logs each as an MLflow run (`eval_name=validation_tail`), picks the lowest-MAPE champion, then scores the sealed holdout (`eval_name=test_holdout`). Tracking can target **Databricks MLflow** or a local compose MLflow server.
 3. **Registry** — Champion promotion to `models:/…@champion` (Databricks Unity Catalog when a catalog is configured; soft-fails otherwise so training/holdout still complete).
-4. **Serving & Monitoring** — FastAPI / Evidently / drift injection (deployment and monitoring workstreams; stubs under `app/` and `monitoring/`).
+4. **Serving** — FastAPI + H2O inference behind a Redis-backed forecast cache and feature store, orchestrated by a daily forecast DAG that precomputes the next operating day and persists to Postgres. Implemented and validated end-to-end in the local Docker stack — see [Serving](#serving) below. Monitoring (Evidently drift detection, actuals-vs-prediction scoring, retrain webhook) is still a stub under `monitoring/`.
 
-Full Databricks wiring notes: [`docs/databricks_experiment_tracking.md`](docs/databricks_experiment_tracking.md).
+Full Databricks wiring notes: [`docs/databricks_experiment_tracking.md`](docs/databricks_experiment_tracking.md). Full serving write-up: [`docs/fastapi_serving_layer.md`](docs/fastapi_serving_layer.md); binding serving spec: [`docs/serving_contract.md`](docs/serving_contract.md).
 
 ## Evaluation
 
@@ -152,11 +154,7 @@ ingest_raw → validate_raw → clean_and_join → validate_joined
 
 `make dag-test` runs the DAG in one process (stops the scheduler first to avoid duplicate task execution).
 
-Serving / dashboards (when those workstreams land):
-
-```bash
-make docker-up          # docker compose --profile serving up
-```
+Serving is implemented — see [Serving](#serving) below for endpoints and how to run it (`make docker-up`).
 
 ### Airflow without Docker (fallback)
 
@@ -166,6 +164,42 @@ make setup-airflow-local
 make mlflow-local           # second shell — :5000
 make dag-test-local
 ```
+
+## Serving
+
+The FastAPI serving layer (`app/`) loads the registered champion via
+`mlflow.h2o.load_model` and answers day-ahead demand forecasts. Two latency
+paths, both measured against the local Docker stack (see the Overview above
+and `docs/serving_contract.md` §8 for the full numbers):
+
+- **Cached** (`/predict` hit, or `GET /forecast`) — reads a precomputed value
+  out of Redis, ~1 ms.
+- **Live** (`/predict` miss, or `/predict/batch`) — runs H2O inference
+  directly, ~300 ms; this is the pandas→JVM round trip, which is exactly why
+  the daily forecast DAG exists: it pays that cost once for 24 hours so every
+  later read of that day is the cached path.
+
+| Endpoint | Purpose |
+|---|---|
+| `POST /predict` | Single-hour forecast, cache-first |
+| `POST /predict/batch` | Multi-hour forecast, one JVM round trip, writes through to the cache |
+| `GET /forecast?grid_id=&date=` | Read-only view of the committed forecast for a day |
+| `GET /health` / `GET /ready` | Liveness / readiness (model + H2O cluster + feature store) |
+| `GET /metrics` | Prometheus scrape target |
+
+```bash
+make run-api            # host, no Redis/Docker needed (parquet feature-store backend)
+
+make docker-up          # docker compose --profile serving up --build
+make seed-redis          # populate the Redis feature store (required once before /predict works)
+make forecast-trigger    # run the daily forecast DAG against the live API
+make forecast-export     # Postgres forecasts -> data/processed/forecasts.csv
+```
+
+Full architecture, the H2O lifecycle rules, the two storage tiers, replay
+mode, and troubleshooting: [`docs/fastapi_serving_layer.md`](docs/fastapi_serving_layer.md).
+Binding spec (49-column feature schema, storage key layout, endpoint
+contracts): [`docs/serving_contract.md`](docs/serving_contract.md).
 
 ### Development
 
@@ -178,24 +212,38 @@ make test    # pytest
 
 ```
 ampops/
-├── dags/                      # Airflow DAG (orchestration only)
+├── dags/
+│   ├── ampops_training_pipeline.py   # ingest -> ... -> register -> evaluate_test
+│   └── ampops_daily_forecast.py      # resolve_horizon -> request_forecast -> persist -> verify_cached
 ├── src/ampops/
 │   ├── config.py              # paths, MODEL_CONFIGS, metrics
 │   ├── data/                  # ingest, clean (DST), join, validate
 │   ├── features/              # calendar + lag features, time split
 │   ├── training/              # bake-off, holdout eval, registry, pipeline
 │   └── utils/
+├── app/                        # FastAPI serving layer (implemented)
+│   ├── main.py                 # endpoints, lifespan (H2O cluster start/stop)
+│   ├── model.py                 # ChampionModel: H2O load + predict lifecycle
+│   ├── features.py             # delegates to ampops.features.build — no feature arithmetic here
+│   ├── store.py                 # FeatureStore / ForecastCache (Redis + parquet/in-memory backends)
+│   ├── schemas.py               # request/response Pydantic models
+│   └── config.py                # env-driven Settings, not memoized
+├── monitoring/
+│   └── prometheus.yml           # scrape config for the api service
 ├── scripts/
 │   ├── run_pipeline_local.py  # data stages without Airflow
 │   ├── run_training.py        # bake-off + holdout CLI (make train)
+│   ├── seed_redis.py           # load joined_hourly.parquet into the Redis feature store
 │   └── download_open_meteo.py
 ├── notebooks/                 # EDA
 ├── tests/
 ├── docs/
 │   ├── AmpOps_Project_Context.md
 │   ├── timezone_alignment_finding.md
-│   └── databricks_experiment_tracking.md
-├── app/ · monitoring/         # Week 3 stubs
+│   ├── databricks_experiment_tracking.md
+│   ├── serving_contract.md            # binding serving spec
+│   ├── fastapi_serving_layer.md       # serving architecture + lifecycle + traps
+│   └── virtiofs_errno35_deadlock.md
 ├── data/{raw,interim,processed}/
 ├── docker-compose.yml
 ├── requirements.txt · requirements-airflow.txt
