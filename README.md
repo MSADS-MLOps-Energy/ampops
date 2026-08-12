@@ -14,8 +14,8 @@ AmpOps automates the end-to-end machine learning lifecycle for short-term load f
 
 ## Data Sources
 
-- **[PJM Hourly Energy Consumption](https://www.kaggle.com/datasets/robikscube/hourly-energy-consumption)** — 10+ years of hourly electricity consumption (MW) across major US regional transmission grids.
-- **[Open-Meteo Historical Weather API](https://open-meteo.com/en/docs/historical-weather-api)** — hourly ambient temperature, relative humidity, dew point, and precipitation, mapped to grid hubs (e.g., ComEd/Chicago, PJM East/Philadelphia).
+- **[PJM Hourly Energy Consumption](https://www.kaggle.com/datasets/robikscube/hourly-energy-consumption)** — 10+ years of hourly electricity consumption (MW) across major US regional transmission grids. AmpOps uses the ComEd zone (`COMED_hourly.csv`).
+- **[Open-Meteo Historical Weather API](https://open-meteo.com/en/docs/historical-weather-api)** — hourly weather for the Chicago point (41.86°N, −87.65°W), 2010–2019.
 
 ## Architecture
 
@@ -23,150 +23,149 @@ AmpOps automates the end-to-end machine learning lifecycle for short-term load f
 Upstream Raw Data Ingestion (PJM Grid + Open-Meteo Weather API)
               │
               ▼
-   1. Data Tracking & DVC        (raw v1 → curated v2 matrices)
+   1. Ingest / clean / join / features   (src/ampops)
               │
-              ▼  (triggers automated DAG)
-   2. Airflow / Prefect Pipeline (lags & rolling averages)
+              ▼
+   2. Airflow DAG or local scripts       (orchestration)
               │
-              ▼  (logs params, hashes, metrics)
-   3. MLflow Model Registry      (champion/challenger metadata)
+              ▼
+   3. MLflow bake-off + holdout          (Databricks or local tracking)
               │
-              ▼  (shadow-deploys containerized candidate)
-   4. FastAPI + Redis Cache      (sub-100ms inference SLA)
+              ▼
+   4. Model Registry (@champion)         (Unity Catalog when configured)
               │
-        ┌─────┴─────────────────┐
-        ▼                       ▼
-   5. Prometheus/Grafana   6. Retrain Webhook Loop
-      (telemetry)             (fires on MAPE/drift > threshold)
+              ▼
+   5. FastAPI + monitoring               (deployment / Week 3)
 ```
 
-**Pipeline stages:**
+**Pipeline stages (implemented):**
 
-1. **Data Ingestion & Versioning** — Raw hourly telemetry lands in `data/raw/`. DVC tracks two dataset versions: `v1` (uncurated) and `v2` (deduplicated, DST-corrected, with engineered lag features `t-1`, `t-24`, `t-168` and 24-hour rolling means).
-2. **Pipeline Automation & Tracking** — An Airflow/Prefect DAG enforces chronological train/holdout splits (final 12 months held out). An H2O AutoML search (multiple algorithms, no cross-validation leakage across time-ordered rows) trains and evaluates candidates in one step, and MLflow logs and registers the leader with semantic versioning.
-3. **Containerization & Deployment** — The champion model is served via a Dockerized FastAPI app backed by a Redis feature cache. Clients pass only a `Grid_ID` and timestamp; the API resolves lag vectors from Redis. New challengers are deployed via shadow routing — evaluated in parallel but not yet acted on.
-4. **Monitoring & Drift Engineering** — Prometheus scrapes endpoint metrics into Grafana. Simulated drift events (unit-mismatch sensor corruption, decoupled temperature/demand vectors) validate resilience. Sustained MAPE > 5% over a 6-hour window fires a webhook that triggers automated retraining.
+1. **Data Ingestion & Features** — Raw CSVs in `data/raw/` are cleaned (DST realignment, dedup), joined, and feature-engineered (calendar + horizon-safe lags). Chronological split: final **12 months** sealed as `test.parquet`.
+2. **Bake-off & Experiment Tracking** — Airflow (or `make train`) trains **linear → random forest → XGBoost**, logs each as an MLflow run (`eval_name=validation_tail`), picks the lowest-MAPE champion, then scores the sealed holdout (`eval_name=test_holdout`). Tracking can target **Databricks MLflow** or a local compose MLflow server.
+3. **Registry** — Champion promotion to `models:/…@champion` (Databricks Unity Catalog when a catalog is configured; soft-fails otherwise so training/holdout still complete).
+4. **Serving & Monitoring** — FastAPI / Evidently / drift injection (deployment and monitoring workstreams; stubs under `app/` and `monitoring/`).
+
+Full Databricks wiring notes: [`docs/databricks_experiment_tracking.md`](docs/databricks_experiment_tracking.md).
 
 ## Evaluation
 
-- **RMSE** — penalizes large prediction misses, mirroring the high cost of peak-demand surprises.
-- **MAPE**, tracked specifically during **top-10th-percentile peak loads** (e.g., hottest summer afternoons) — the business KPI that matters most, since blackout risk is highest exactly when demand peaks.
+| Split | Purpose | Primary metric |
+|---|---|---|
+| Validation tail (last 3 months of **train**) | Model selection in the bake-off | **MAPE** (RMSE, MAE secondary) |
+| Sealed test (final 12 months) | Holdout after champion selection | **MAPE** |
+
+Each MLflow run also logs hyperparameters (`n_estimators`, … plus `hp.*` copies and a `hyperparams.json` artifact) and wall-clock timing so runs can be compared and re-executed.
 
 ## Tech Stack
 
-`Python` · `H2O AutoML` · `Airflow` / `Prefect` · `DVC` · `MLflow` · `FastAPI` · `Redis` · `Docker` · `Prometheus` · `Grafana` · `Ruff`
+`Python 3.11` · `XGBoost` · `scikit-learn` · `Airflow` · `MLflow` (+ Databricks) · `FastAPI` · `Docker` · `Evidently` (planned) · `Ruff` · `pytest`
 
 ## Getting Started
 
 ### Prerequisites
-- Docker & Docker Compose (required — the pipeline runs in containers)
-- Python 3.11 (optional, for running tests and the data stages on the host)
+
+- **Python 3.11** (conda env `ampops` or `make setup` → `.venv`)
+- Docker & Docker Compose (optional — for the full Airflow stack)
+- Databricks workspace + PAT (optional — for cloud experiment tracking)
 
 ### Getting the data
 
-Datasets are not committed to git. Download both files into `data/raw/` before
-running the pipeline — the filenames matter, since `src/ampops/config.py`
-resolves them by name:
+Datasets are not committed to git. Place both files in `data/raw/` (filenames matter):
 
 | File | Source | Notes |
 |---|---|---|
-| `COMED_hourly.csv` | [Kaggle: Hourly Energy Consumption](https://www.kaggle.com/datasets/robikscube/hourly-energy-consumption) | Take `COMED_hourly.csv` from the archive. 66,497 rows, 2011-01-01 → 2018-08-03. |
-| `open-meteo-41.86N87.65W179m.csv` | [Open-Meteo Historical Weather API](https://open-meteo.com/en/docs/historical-weather-api) | Chicago point 41.86N, -87.65W. Hourly variables, 2010-01-01 → 2019-12-31. |
-
-The pipeline validates both on ingest, so a wrong file or truncated download
-fails at `validate_raw` with a specific message rather than silently producing a
-bad model.
-
-Everything under `data/interim/` and `data/processed/` is generated — never
-commit it, and never hand-edit it. Inside the Docker stack these two stages are
-**named volumes**, not host directories: the pipeline rewrites the same fixed
-paths on every run, and doing that across a macOS bind mount trips a Docker
-Desktop/VirtioFS bug (`docs/virtiofs_errno35_deadlock.md`). Use `make
-data-export` to copy the generated parquets back to the host, and `make
-data-import` to push host copies in. `data/raw/` is unaffected — it stays
-bind-mounted, so dropping the two CSVs there is all the setup it needs.
-
-### Reproducing the training pipeline
-
-The whole pipeline runs in Docker. From a fresh clone, with the two raw files in
-place:
+| `COMED_hourly.csv` | [Kaggle: Hourly Energy Consumption](https://www.kaggle.com/datasets/robikscube/hourly-energy-consumption) | 66,497 rows, 2011-01-01 → 2018-08-03 |
+| `open-meteo-41.86N87.65W179m.csv` | Open-Meteo archive, or regenerate locally | Chicago 41.86N/−87.65W, hourly, 2010–2019, fixed UTC−5 |
 
 ```bash
-git clone https://github.com/<your-org>/ampops.git
-cd ampops
-
-cp .env.example .env    # Airflow credentials, MLflow URI
-make airflow-up         # builds the image and starts postgres, MLflow, Airflow
+# Optional: regenerate the weather file (writes the 3-line preamble ingest expects)
+python scripts/download_open_meteo.py
 ```
 
-First build takes a few minutes. When it finishes:
+Everything under `data/interim/` and `data/processed/` is generated — never commit it.
+
+### Configure tracking
+
+```bash
+cp .env.example .env
+```
+
+**Databricks (recommended for the course demo):**
+
+```env
+MLFLOW_TRACKING_URI=databricks
+MLFLOW_EXPERIMENT=/Users/you@uchicago.edu/Ampops
+DATABRICKS_HOST=https://<workspace>.cloud.databricks.com
+DATABRICKS_TOKEN=<pat>
+MLFLOW_REGISTRY_URI=databricks-uc
+AMPOPS_MODEL_NAME=ampops_demand_forecaster
+# AMPOPS_UC_MODEL_PREFIX=catalog.schema   # if your UC catalog is not main.default
+```
+
+**Local compose MLflow:** leave `MLFLOW_TRACKING_URI=http://mlflow:5000` (Airflow) / use `http://localhost:5050` in the browser.
+
+### Fast path: local data + train → Databricks
+
+```bash
+conda activate ampops          # or: make setup && source .venv/bin/activate
+set -a && source .env && set +a
+
+make pipeline-local            # ingest → join → features → train/test split
+make train                     # bake-off → register (best-effort) → sealed holdout
+```
+
+Useful variants:
+
+```bash
+python scripts/run_training.py --models xgboost
+python scripts/run_training.py --skip-register
+python scripts/run_training.py --from-run <run_id> --skip-register
+python scripts/run_training.py --models xgboost --param n_estimators=300
+```
+
+### Airflow stack (Docker)
+
+```bash
+cp .env.example .env           # include Databricks vars if Airflow should log there
+make airflow-up                # postgres, MLflow, Airflow
+```
 
 | Service | URL | Credentials |
 |---|---|---|
 | Airflow UI | http://localhost:8080 | `admin` / `admin` |
-| MLflow UI | http://localhost:5050 | — |
+| Local MLflow UI | http://localhost:5050 | — (unused if tracking URI is `databricks`) |
 
-Open the Airflow UI, find **`ampops_training_pipeline`**, and trigger it with the
-▶ button. It runs:
-
-```
-ingest_raw → validate_raw → clean_and_join → validate_joined
-  → build_features → split_train_test
-  → run_automl → register → evaluate_test
-```
-
-`run_automl` runs an H2O AutoML search (up to `AUTOML_MAX_MODELS` candidates,
-bounded by `AUTOML_MAX_RUNTIME_SECS`) and hands its leader to `register`, which
-promotes it to `@champion`; `evaluate_test` then reloads that exact registered
-version and scores it against the sealed test holdout, tagging the result. On
-success you'll have `{joined_hourly,features,train,test}.parquet` in the
-`ampops-data-processed` volume (`make data-export` copies them to
-`data/processed/` on the host), an MLflow run per model H2O trained, and
-`ampops-demand-forecaster` registered with the `@champion` alias plus
-validation and test metrics. See `docs/automl_implementation.md` for how the
-search works and how to run it locally (it needs a local JVM outside Docker).
-
-Or trigger the same run from the command line:
+Trigger **`ampops_training_pipeline`** in the UI or:
 
 ```bash
 make dag-trigger
 ```
 
-For DAG development there is also `make dag-test`, which runs the whole DAG in a
-single process. It stops the scheduler first, deliberately: `airflow dags test`
-writes into the same metadata database the scheduler polls, so a running
-scheduler races it and executes every task twice — visible only as duplicate
-MLflow runs, never as an error.
+DAG shape:
 
-Serving and dashboard services (FastAPI, Redis, Prometheus, Grafana) sit behind a
-compose profile because they depend on files the deployment and monitoring
-workstreams have not written yet:
+```
+ingest_raw → validate_raw → clean_and_join → validate_joined
+  → build_features → split_train_test
+  → train[linear | random_forest | xgboost]   (dynamically mapped)
+  → choose_champion → register → score_holdout
+```
+
+`make dag-test` runs the DAG in one process (stops the scheduler first to avoid duplicate task execution).
+
+Serving / dashboards (when those workstreams land):
 
 ```bash
 make docker-up          # docker compose --profile serving up
 ```
 
-### Running Airflow without Docker (fallback)
-
-The identical DAG runs in a local Python 3.11 venv — useful if Docker is
-unavailable or slow to pull base images:
+### Airflow without Docker (fallback)
 
 ```bash
-make setup                  # venv + dependencies
-make setup-airflow-local    # Airflow 2.9.3 under the official constraints
-make mlflow-local           # in a second shell — tracking server on :5000
-make dag-test-local         # runs the full DAG in one process
+make setup
+make setup-airflow-local
+make mlflow-local           # second shell — :5000
+make dag-test-local
 ```
-
-### Running the data stages without Docker
-
-```bash
-make setup                     # Python 3.11 venv + dependencies
-make pipeline-local            # ingest → validate → join → features → split
-```
-
-This skips training (which needs the MLflow server) but regenerates every
-processed dataset, and is the quickest way to check a change to `src/ampops/`.
 
 ### Development
 
@@ -179,23 +178,25 @@ make test    # pytest
 
 ```
 ampops/
-├── dags/               # Airflow DAG (orchestration only, no business logic)
-├── src/ampops/         # the pipeline package
-│   ├── config.py       # paths, constants, AutoML settings — single source of truth
-│   ├── data/           # ingest, clean (DST realignment), join, validate
-│   ├── features/       # calendar + lag feature engineering, chronological split
-│   ├── training/       # H2O AutoML search, registry promotion
-│   └── utils/          # parquet IO, logging
-├── scripts/            # run_pipeline_local.py
-├── notebooks/          # 01_join_and_eda.ipynb (EDA deliverable)
-├── tests/              # pytest: cleaning, features, split, gates, DAG structure
-├── app/                # FastAPI service (deployment workstream)
-├── monitoring/         # Prometheus/Grafana config (monitoring workstream)
-├── data/
-│   ├── raw/            # source CSVs
-│   ├── interim/        # per-stage intermediates
-│   └── processed/      # joined, features, train, test
-├── docker/airflow/     # Airflow image
+├── dags/                      # Airflow DAG (orchestration only)
+├── src/ampops/
+│   ├── config.py              # paths, MODEL_CONFIGS, metrics
+│   ├── data/                  # ingest, clean (DST), join, validate
+│   ├── features/              # calendar + lag features, time split
+│   ├── training/              # bake-off, holdout eval, registry, pipeline
+│   └── utils/
+├── scripts/
+│   ├── run_pipeline_local.py  # data stages without Airflow
+│   ├── run_training.py        # bake-off + holdout CLI (make train)
+│   └── download_open_meteo.py
+├── notebooks/                 # EDA
+├── tests/
+├── docs/
+│   ├── AmpOps_Project_Context.md
+│   ├── timezone_alignment_finding.md
+│   └── databricks_experiment_tracking.md
+├── app/ · monitoring/         # Week 3 stubs
+├── data/{raw,interim,processed}/
 ├── docker-compose.yml
 ├── requirements.txt · requirements-airflow.txt
 └── Makefile

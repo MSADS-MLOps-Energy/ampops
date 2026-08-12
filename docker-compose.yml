@@ -23,8 +23,15 @@ x-airflow-common: &airflow-common
     PYTHONPATH: /opt/airflow/src
     # Absolute paths so ampops.config resolves the same way in every container.
     AMPOPS_DATA_DIR: /opt/airflow/data
-    MLFLOW_TRACKING_URI: http://mlflow:5000
-    MLFLOW_EXPERIMENT: ampops-demand-forecasting
+    # Databricks is the default tracking backend when .env sets these.
+    # Override with MLFLOW_TRACKING_URI=http://mlflow:5000 for compose-local MLflow.
+    MLFLOW_TRACKING_URI: ${MLFLOW_TRACKING_URI:-databricks}
+    MLFLOW_EXPERIMENT: ${MLFLOW_EXPERIMENT:-ampops-demand-forecasting}
+    MLFLOW_REGISTRY_URI: ${MLFLOW_REGISTRY_URI:-databricks-uc}
+    DATABRICKS_HOST: ${DATABRICKS_HOST:-}
+    DATABRICKS_TOKEN: ${DATABRICKS_TOKEN:-}
+    AMPOPS_MODEL_NAME: ${AMPOPS_MODEL_NAME:-ampops-demand-forecaster}
+    AMPOPS_UC_MODEL_PREFIX: ${AMPOPS_UC_MODEL_PREFIX:-}
     # The Airflow image has no git binary, so MLflow cannot stamp a source Git
     # SHA. Harmless, but GitPython otherwise dumps a 15-line "Bad git
     # executable" block into every training task log.

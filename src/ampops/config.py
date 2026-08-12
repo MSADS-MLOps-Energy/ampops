@@ -108,9 +108,28 @@ TEST_MONTHS = 12
 
 # --- Training ---------------------------------------------------------------
 
-MLFLOW_TRACKING_URI = os.getenv("MLFLOW_TRACKING_URI", "http://localhost:5000")
+# Default tracking is Databricks MLflow (`MLFLOW_TRACKING_URI=databricks` plus
+# DATABRICKS_HOST / DATABRICKS_TOKEN). Local compose MLflow remains available
+# by setting MLFLOW_TRACKING_URI=http://mlflow:5000 (in Docker) or
+# http://localhost:5050 (host).
+MLFLOW_TRACKING_URI = os.getenv("MLFLOW_TRACKING_URI", "databricks")
 MLFLOW_EXPERIMENT = os.getenv("MLFLOW_EXPERIMENT", "ampops-demand-forecasting")
+MLFLOW_REGISTRY_URI = os.getenv("MLFLOW_REGISTRY_URI", "databricks-uc")
 REGISTERED_MODEL_NAME = os.getenv("AMPOPS_MODEL_NAME", "ampops-demand-forecaster")
+# When the registered name is not already `catalog.schema.model`, prefix it.
+# Leave empty if using workspace registry or a fully-qualified AMPOPS_MODEL_NAME.
+UC_MODEL_PREFIX = os.getenv("AMPOPS_UC_MODEL_PREFIX", "").strip()
+
+
+def resolve_registered_model_name(name: str | None = None) -> str:
+    """Return a registry model name, applying AMPOPS_UC_MODEL_PREFIX if needed."""
+    resolved = name or REGISTERED_MODEL_NAME
+    if resolved.count(".") >= 2:
+        return resolved
+    if UC_MODEL_PREFIX:
+        return f"{UC_MODEL_PREFIX}.{resolved}"
+    return resolved
+
 
 RANDOM_SEED = 42
 

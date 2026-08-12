@@ -130,13 +130,13 @@ def ampops_training_pipeline():
 
     @task
     def evaluate_test(registration: dict, test_path: str) -> dict:
-        """Reload the just-registered champion and score it on the sealed test holdout.
+        """Score the sealed test holdout using the registration's model_uri.
 
-        Runs after registration, not before — model selection is decided on
-        train/validate alone (see ampops.training.automl); this only scores
-        and tags the version that's already been promoted to @champion.
+        Prefer the registry URI when promotion succeeded; otherwise fall back to
+        `runs:/<run_id>/model` (Databricks soft-fail path). Selection never uses
+        this holdout.
         """
-        model_uri = f"models:/{registration['registered_model']}/{registration['version']}"
+        model_uri = registration["model_uri"]
         metrics = automl.evaluate_on_test(model_uri, test_path)
         return registry.tag_test_metrics(registration, metrics)
 

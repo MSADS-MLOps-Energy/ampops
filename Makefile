@@ -1,6 +1,19 @@
 .PHONY: setup lint test run-api dvc-init docker-up docker-down \
         airflow-up airflow-down airflow-logs airflow-reset dag-test pipeline-local \
-        data-export data-import
+        data-export data-import train
+
+# Prefer repo .venv when present; otherwise use whatever `python` is active
+# (e.g. conda env ampops). Override with: make train PYTHON=/path/to/python
+PYTHON ?= $(shell if [ -x .venv/bin/python ]; then echo .venv/bin/python; else echo python; fi)
+
+# Homebrew OpenJDK is keg-only; without this, H2O finds the macOS /usr/bin/java stub.
+ifneq ($(wildcard /opt/homebrew/opt/openjdk@17/bin/java),)
+  export JAVA_HOME := /opt/homebrew/opt/openjdk@17
+  export PATH := $(JAVA_HOME)/bin:$(PATH)
+else ifneq ($(wildcard /usr/local/opt/openjdk@17/bin/java),)
+  export JAVA_HOME := /usr/local/opt/openjdk@17
+  export PATH := $(JAVA_HOME)/bin:$(PATH)
+endif
 
 # --- Local development ------------------------------------------------------
 
@@ -19,7 +32,13 @@ test:
 # Run the data stages outside Airflow — the fastest way to check a change to
 # the ampops package without waiting on the scheduler.
 pipeline-local:
-	. .venv/bin/activate && python scripts/run_pipeline_local.py
+	$(PYTHON) scripts/run_pipeline_local.py
+
+# Host-side H2O AutoML → Databricks MLflow (needs Java 8–17 + h2o + .env creds).
+# Loads `.env` when present so DATABRICKS_* / MLFLOW_* are set for the child process.
+train:
+	@if [ -f .env ]; then set -a; . ./.env; set +a; fi; \
+	$(PYTHON) scripts/run_training.py
 
 # --- Airflow stack ----------------------------------------------------------
 

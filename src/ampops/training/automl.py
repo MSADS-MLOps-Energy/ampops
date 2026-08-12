@@ -45,7 +45,12 @@ corrupt or block a subsequent attempt.
 
 from __future__ import annotations
 
+import json
+import os
 import socket
+import tempfile
+import time
+from pathlib import Path
 from typing import Any
 
 import h2o
@@ -62,6 +67,44 @@ from ampops.utils.io import get_logger
 
 logger = get_logger(__name__)
 
+# MLflow tags / params so runs stay comparable across local and Databricks.
+# Selection still never uses the sealed test holdout.
+EVAL_NAME_VALIDATION = "validation_tail"
+EVAL_NAME_TEST = "test_holdout"
+
+_HOMEBREW_JAVA_CANDIDATES = (
+    Path("/opt/homebrew/opt/openjdk@17"),
+    Path("/usr/local/opt/openjdk@17"),
+    Path("/opt/homebrew/opt/openjdk@11"),
+    Path("/usr/local/opt/openjdk@11"),
+)
+
+
+def _ensure_java_home() -> None:
+    """Point JAVA_HOME at a real JDK when macOS only has the /usr/bin/java stub.
+
+    Homebrew OpenJDK is keg-only, so H2O otherwise finds the stub and fails with
+    `Command ['/usr/bin/java', '-version'] returned non-zero exit status 1`.
+    """
+    existing = os.environ.get("JAVA_HOME")
+    if existing and (Path(existing) / "bin" / "java").is_file():
+        return
+
+    for home in _HOMEBREW_JAVA_CANDIDATES:
+        java = home / "bin" / "java"
+        if java.is_file():
+            os.environ["JAVA_HOME"] = str(home)
+            os.environ["PATH"] = f"{home / 'bin'}{os.pathsep}{os.environ.get('PATH', '')}"
+            logger.info("Using JAVA_HOME=%s for H2O", home)
+            return
+
+
+def _configure_tracking(tracking_uri: str | None = None) -> None:
+    uri = tracking_uri or config.MLFLOW_TRACKING_URI
+    mlflow.set_tracking_uri(uri)
+    if config.MLFLOW_REGISTRY_URI:
+        mlflow.set_registry_uri(config.MLFLOW_REGISTRY_URI)
+
 
 def _free_port() -> int:
     """Return a currently-free localhost TCP port.
@@ -76,6 +119,137 @@ def _free_port() -> int:
         return sock.getsockname()[1]
 
 
+# H2O uses its own names; expose sklearn / XGBoost-style aliases in MLflow so
+# runs are readable next to the old bake-off experiments.
+_H2O_PARAM_ALIASES: dict[str, str] = {
+    "ntrees": "n_estimators",
+    "n_estimators": "n_estimators",
+    "learn_rate": "learning_rate",
+    "learning_rate": "learning_rate",
+    "sample_rate": "subsample",
+    "subsample": "subsample",
+    "col_sample_rate": "colsample_bytree",
+    "col_sample_rate_per_tree": "colsample_bytree",
+    "colsample_bytree": "colsample_bytree",
+    "max_depth": "max_depth",
+    "min_rows": "min_rows",
+    "min_child_weight": "min_child_weight",
+    "nbins": "max_bins",
+    "stopping_rounds": "early_stopping_rounds",
+    "stopping_tolerance": "early_stopping_tolerance",
+    "seed": "seed",
+}
+
+# Prefer these as top-level MLflow params (UI-friendly); full dump goes to JSON.
+_PRIMARY_PARAM_KEYS = (
+    "n_estimators",
+    "learning_rate",
+    "subsample",
+    "colsample_bytree",
+    "max_depth",
+    "min_rows",
+    "min_child_weight",
+    "max_bins",
+    "early_stopping_rounds",
+    "seed",
+)
+
+
+def _jsonable(value: Any) -> Any:
+    """Coerce an H2O param value into something JSON / MLflow can store."""
+    if value is None or isinstance(value, (bool, int, float, str)):
+        return value
+    if isinstance(value, (list, tuple)):
+        # H2O sometimes returns [name, value] pairs for enum-like fields.
+        if len(value) == 2 and isinstance(value[0], str):
+            return _jsonable(value[1])
+        return [_jsonable(v) for v in value]
+    if isinstance(value, dict):
+        return {str(k): _jsonable(v) for k, v in value.items()}
+    text = str(value)
+    return text if len(text) <= 500 else text[:497] + "..."
+
+
+def _raw_leader_params(leader: Any) -> dict[str, Any]:
+    """Pull a flat dict of hyperparameters from an H2O model object."""
+    raw = getattr(leader, "actual_params", None)
+    if not isinstance(raw, dict) or not raw:
+        raw = getattr(leader, "params", None)
+    if not isinstance(raw, dict):
+        return {}
+
+    out: dict[str, Any] = {}
+    for key, value in raw.items():
+        # `params` on some estimators is {name: {actual, default, ...}}.
+        if isinstance(value, dict) and "actual" in value:
+            value = value["actual"]
+        elif isinstance(value, dict) and "actual_value" in value:
+            value = value["actual_value"]
+        out[str(key)] = _jsonable(value)
+    return out
+
+
+def extract_leader_hyperparams(leader: Any) -> dict[str, Any]:
+    """Build a hyperparams payload with H2O names plus familiar aliases."""
+    raw = _raw_leader_params(leader)
+    aliases: dict[str, Any] = {}
+    for h2o_key, alias in _H2O_PARAM_ALIASES.items():
+        if h2o_key in raw and raw[h2o_key] is not None:
+            aliases.setdefault(alias, raw[h2o_key])
+
+    return {
+        "model_name": getattr(leader, "algo", None),
+        "model_id": getattr(leader, "model_id", None),
+        "params": raw,
+        "aliases": aliases,
+    }
+
+
+def _log_param_safe(key: str, value: Any) -> None:
+    if value is None or isinstance(value, (dict, list)):
+        return
+    text = str(value)
+    if len(text) > 250:
+        text = text[:247] + "..."
+    try:
+        mlflow.log_param(key, text)
+    except Exception as exc:  # noqa: BLE001 — Databricks param-count / length limits
+        logger.debug("Skipped MLflow param %s: %s", key, exc)
+
+
+def _log_leader_params(leader: Any) -> dict[str, Any]:
+    """Log readable hyperparams to MLflow params + a hyperparams.json artifact."""
+    payload = extract_leader_hyperparams(leader)
+    aliases = payload.get("aliases") or {}
+    raw = payload.get("params") or {}
+
+    for key in _PRIMARY_PARAM_KEYS:
+        if key in aliases:
+            _log_param_safe(key, aliases[key])
+
+    # Also keep the H2O-native names under hp.* for exact re-inspection.
+    for key in (
+        "ntrees",
+        "learn_rate",
+        "sample_rate",
+        "col_sample_rate",
+        "max_depth",
+        "min_rows",
+        "nbins",
+        "stopping_rounds",
+        "seed",
+    ):
+        if key in raw:
+            _log_param_safe(f"hp.{key}", raw[key])
+
+    with tempfile.TemporaryDirectory() as tmp:
+        path = Path(tmp) / "hyperparams.json"
+        path.write_text(json.dumps(payload, indent=2, default=str), encoding="utf-8")
+        mlflow.log_artifact(str(path), artifact_path="params")
+
+    return payload
+
+
 def run_h2o_automl(
     train_path: str,
     tracking_uri: str | None = None,
@@ -87,19 +261,21 @@ def run_h2o_automl(
     valid input to `ampops.training.registry.register_champion`):
     `{model_name, run_id, mape, rmse, mae, n_train, n_valid}`.
     """
-    mlflow.set_tracking_uri(tracking_uri or config.MLFLOW_TRACKING_URI)
+    _configure_tracking(tracking_uri)
     mlflow.set_experiment(experiment or config.MLFLOW_EXPERIMENT)
 
     df = pd.read_parquet(train_path)
     fit_df, valid_df = time_split(df, test_months=VALIDATION_MONTHS)
     features = feature_columns(df)
 
+    _ensure_java_home()
     port = _free_port()
     h2o.init(port=port, start_h2o=True)
     try:
         fit_h2o = h2o.H2OFrame(fit_df[[*features, config.TARGET]])
         valid_h2o = h2o.H2OFrame(valid_df[[*features, config.TARGET]])
 
+        started = time.perf_counter()
         aml = H2OAutoML(
             max_runtime_secs=config.AUTOML_MAX_RUNTIME_SECS,
             max_models=config.AUTOML_MAX_MODELS,
@@ -119,8 +295,10 @@ def run_h2o_automl(
         y_valid = valid_df[config.TARGET]
         metrics = evaluate(y_valid, y_pred)
         model_name = leader.algo
+        duration_seconds = time.perf_counter() - started
 
         with mlflow.start_run(run_name=f"automl-{model_name}") as run:
+            mlflow.log_param("eval_name", EVAL_NAME_VALIDATION)
             mlflow.log_param("model_name", model_name)
             mlflow.log_param("model_id", leader.model_id)
             mlflow.log_param("n_features", len(features))
@@ -128,7 +306,8 @@ def run_h2o_automl(
             mlflow.log_param("horizon_hours", config.HORIZON_HOURS)
             mlflow.log_param("automl_max_runtime_secs", config.AUTOML_MAX_RUNTIME_SECS)
             mlflow.log_param("automl_max_models", config.AUTOML_MAX_MODELS)
-            mlflow.log_metrics(metrics)
+            mlflow.log_metrics({**metrics, "duration_seconds": duration_seconds})
+            hyperparams = _log_leader_params(leader)
             mlflow.h2o.log_model(leader, artifact_path="model")
 
             result = {
@@ -136,16 +315,18 @@ def run_h2o_automl(
                 "run_id": run.info.run_id,
                 "n_train": len(fit_df),
                 "n_valid": len(valid_df),
+                "hyperparams": hyperparams.get("aliases") or {},
                 **metrics,
             }
 
         logger.info(
-            "H2O AutoML leader %s (%s) | MAPE %.4f | RMSE %.1f MW | run %s",
+            "H2O AutoML leader %s (%s) | MAPE %.4f | RMSE %.1f MW | run %s | hp %s",
             leader.model_id,
             model_name,
             metrics["mape"],
             metrics["rmse"],
             result["run_id"],
+            result["hyperparams"],
         )
         return result
     finally:
@@ -168,11 +349,12 @@ def evaluate_on_test(
     discipline as `run_h2o_automl` (fresh port, `finally`-shutdown) since this
     runs as its own Airflow task/process with no cluster to inherit.
     """
-    mlflow.set_tracking_uri(tracking_uri or config.MLFLOW_TRACKING_URI)
+    _configure_tracking(tracking_uri)
 
     test_df = pd.read_parquet(test_path)
     features = feature_columns(test_df)
 
+    _ensure_java_home()
     port = _free_port()
     h2o.init(port=port, start_h2o=True)
     try:
