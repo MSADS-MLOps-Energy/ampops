@@ -26,6 +26,9 @@ fastapi
 uvicorn[standard]
 pydantic
 redis
+# FastAPI's TestClient dependency; also the HTTP client for anything that needs
+# to call the API from inside the same image.
+httpx
 
 # --- Weather / external data ---
 requests

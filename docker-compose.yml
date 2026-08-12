@@ -4,10 +4,11 @@
 # Airflow (init/scheduler/webserver).
 #
 # The serving and dashboard services (api, redis, prometheus, grafana) are
-# behind the "serving" profile because they depend on files the deployment and
-# monitoring workstreams have not written yet (app/main.py, monitoring/
-# prometheus.yml). Start them once those exist:
+# behind the "serving" profile so the training stack can come up without paying
+# for a JVM, a Redis, and two dashboards. Start them with:
 #     docker compose --profile serving up -d
+# then `make seed-redis` — an unseeded feature store answers every /predict
+# with 422, because there is no history to build a window from.
 
 x-airflow-common: &airflow-common
   build:
@@ -32,6 +33,16 @@ x-airflow-common: &airflow-common
     DATABRICKS_TOKEN: ${DATABRICKS_TOKEN:-}
     AMPOPS_MODEL_NAME: ${AMPOPS_MODEL_NAME:-ampops-demand-forecaster}
     AMPOPS_UC_MODEL_PREFIX: ${AMPOPS_UC_MODEL_PREFIX:-}
+    # Where dags/ampops_daily_forecast.py sends POST /predict/batch. Inference
+    # only ever happens in the api service — the DAG is a thin HTTP client.
+    AMPOPS_API_URL: ${AMPOPS_API_URL:-http://api:8000}
+    # Replay mode: the dataset ends 2018-08-02, so "today" is simulated and the
+    # DAG forecasts the following 24 hours from seeded observations. A live
+    # deployment would need Open-Meteo's forecast API instead.
+    AMPOPS_SIMULATED_TODAY: ${AMPOPS_SIMULATED_TODAY:-2018-08-01}
+    # Airflow reads connections out of AIRFLOW_CONN_* env vars, so the forecast
+    # DAG's Postgres connection needs no manual setup in the UI.
+    AIRFLOW_CONN_AMPOPS_DB: postgresql://airflow:airflow@postgres/ampops
     # The Airflow image has no git binary, so MLflow cannot stamp a source Git
     # SHA. Harmless, but GitPython otherwise dumps a 15-line "Bad git
     # executable" block into every training task log.
@@ -70,6 +81,10 @@ services:
       POSTGRES_DB: airflow
     volumes:
       - postgres-data:/var/lib/postgresql/data
+      # Creates the `ampops` database (the forecast system of record) next to
+      # Airflow's own. Runs ONLY on a fresh postgres-data volume — existing
+      # stacks need `make ampops-db-init`.
+      - ./docker/postgres:/docker-entrypoint-initdb.d:ro
     healthcheck:
       test: ["CMD", "pg_isready", "-U", "airflow"]
       interval: 5s
@@ -158,6 +173,11 @@ services:
     container_name: ampops-api
     profiles: ["serving"]
     env_file: .env
+    environment:
+      REDIS_URL: ${REDIS_URL:-redis://redis:6379/0}
+      # Redis is the compose backend pair (feature store + forecast cache).
+      # "parquet" is the host/test pair and must not be used here.
+      AMPOPS_STORE_BACKEND: redis
     ports:
       - "8000:8000"
     depends_on:
@@ -165,6 +185,19 @@ services:
       - mlflow
     volumes:
       - ./app:/app/app
+      # src/ is mounted for the same reason the Airflow services mount it: the
+      # API's feature builder calls ampops.features.build directly, so an edit
+      # there must reach serving without a rebuild.
+      - ./src:/app/src
+    healthcheck:
+      # /health is liveness only and never touches H2O, Redis, or MLflow, so it
+      # stays green while the model is still loading. /ready is the readiness
+      # signal — check that one when debugging a missing champion.
+      test: ["CMD", "curl", "--fail", "http://localhost:8000/health"]
+      interval: 15s
+      timeout: 5s
+      retries: 10
+      start_period: 90s
 
   redis:
     image: redis:7-alpine
