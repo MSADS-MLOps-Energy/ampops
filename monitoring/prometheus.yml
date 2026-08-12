@@ -1,0 +1,26 @@
+# Prometheus scrape config for the AmpOps stack.
+#
+# The API exposes `prometheus-fastapi-instrumentator` defaults plus three
+# AmpOps-specific series (see app/main.py): prediction latency by source,
+# predicted MW, and forecast-cache hits/misses. Those are what the retrain
+# webhook and the drift dashboards are built on.
+#
+# 15s is fast enough that a demo shows movement while a request is being made,
+# and slow enough that the histograms are not dominated by scrape overhead.
+global:
+  scrape_interval: 15s
+  evaluation_interval: 15s
+
+scrape_configs:
+  - job_name: ampops-api
+    metrics_path: /metrics
+    static_configs:
+      # `api` resolves on the compose network; both services live in the
+      # "serving" profile, so they come up together or not at all.
+      - targets: ["api:8000"]
+        labels:
+          service: ampops-api
+
+  - job_name: prometheus
+    static_configs:
+      - targets: ["localhost:9090"]
