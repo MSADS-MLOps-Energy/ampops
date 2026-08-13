@@ -1,0 +1,51 @@
+# Build context exclusions.
+#
+# Two reasons this file matters, both learned the hard way:
+#
+# 1. SECRETS. The root Dockerfile does `COPY . .`, so without this file `.env`
+#    (Databricks host + PAT) is copied into an image layer and persists there
+#    even if a later layer deletes it. Never let credentials into the context.
+#
+# 2. SPEED. `.venv` alone is ~887MB; with data/, .git/ and caches the context
+#    ran to hundreds of MB and the build spent minutes just transferring it.
+#    Nothing here is needed at runtime: dags/ and src/ are bind-mounted for
+#    live editing, data/raw is a read-only bind mount, and data/interim +
+#    data/processed are named volumes (see docs/virtiofs_errno35_deadlock.md).
+
+# --- Secrets and local config ---
+.env
+.env.*
+!.env.example
+.databrickscfg
+.claude/
+
+# --- Virtualenvs and VCS ---
+.venv/
+venv/
+.git/
+.gitignore
+
+# --- Generated data and run artifacts ---
+data/
+logs/
+mlruns/
+mlartifacts/
+.mlflow/
+.airflow/
+
+# --- Caches ---
+__pycache__/
+*.py[cod]
+.pytest_cache/
+.ruff_cache/
+.mypy_cache/
+.ipynb_checkpoints/
+
+# --- Not needed to serve a model ---
+notebooks/
+docs/
+*.md
+!README.md
+
+# --- OS noise ---
+.DS_Store

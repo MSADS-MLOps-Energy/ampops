@@ -1,6 +1,7 @@
 .PHONY: setup lint test run-api dvc-init docker-up docker-down \
         airflow-up airflow-down airflow-logs airflow-reset dag-test pipeline-local \
-        data-export data-import train
+        data-export data-import train \
+        seed-redis ampops-db-init forecast-trigger forecast-export
 
 # Prefer repo .venv when present; otherwise use whatever `python` is active
 # (e.g. conda env ampops). Override with: make train PYTHON=/path/to/python
@@ -24,10 +25,8 @@ setup:
 lint:
 	ruff check .
 
-# --cov=app dropped: the app/ package does not exist yet, and pytest-cov errors
-# on a missing source. Re-add it when the serving workstream lands.
 test:
-	pytest -v
+	pytest -v --cov=app
 
 # Run the data stages outside Airflow — the fastest way to check a change to
 # the ampops package without waiting on the scheduler.
@@ -125,14 +124,51 @@ dag-test-local:
 
 # --- Serving stack (deployment workstream) ----------------------------------
 
+# --reload implies a single worker, which is what the API requires anyway: each
+# worker starts its own H2O JVM and they would race on the port (app/model.py).
+# AMPOPS_STORE_BACKEND=parquet is the Redis-free host pair.
 run-api:
-	uvicorn app.main:app --reload --host 0.0.0.0 --port 8000
+	AMPOPS_STORE_BACKEND=parquet PYTHONPATH=$(PWD)/src \
+		$(PYTHON) -m uvicorn app.main:app --reload --host 0.0.0.0 --port 8000
 
 docker-up:
 	docker compose --profile serving up --build
 
 docker-down:
 	docker compose --profile serving down -v
+
+# Load joined_hourly.parquet into the Redis feature store. Required before the
+# API can answer anything — an unseeded store returns 422 for every timestamp.
+# Runs on the host against the published Redis port.
+seed-redis:
+	REDIS_URL=$${REDIS_URL:-redis://localhost:6379/0} \
+		$(PYTHON) scripts/seed_redis.py
+
+# Create the `ampops` database on an EXISTING postgres-data volume. Idempotent.
+# docker/postgres/init-ampops-db.sh covers the fresh-volume case; postgres:15
+# only runs initdb scripts the first time a volume is initialized, which is why
+# both exist.
+ampops-db-init:
+	docker compose exec -T postgres sh -c \
+		"psql -U airflow -d postgres -tAc \"SELECT 1 FROM pg_database WHERE datname='ampops'\" | grep -q 1 \
+		 || psql -U airflow -d postgres -c 'CREATE DATABASE ampops'"
+	@echo "ampops database ready"
+
+# Trigger the daily forecast DAG. Needs the serving profile up (`make docker-up`)
+# — the DAG fails fast and says so if the api service is not reachable.
+forecast-trigger:
+	docker compose exec airflow-scheduler \
+		airflow dags trigger ampops_daily_forecast
+
+# Postgres lives in a named volume, so `make airflow-reset` (compose down -v)
+# destroys it. This CSV is the only host-side copy that survives one.
+forecast-export:
+	@mkdir -p data/processed
+	docker compose exec -T postgres \
+		psql -U airflow -d ampops -c \
+		"COPY (SELECT * FROM forecasts ORDER BY target_ts) TO STDOUT WITH CSV HEADER" \
+		> data/processed/forecasts.csv
+	@echo "Exported -> data/processed/forecasts.csv"
 
 dvc-init:
 	dvc init
