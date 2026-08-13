@@ -62,7 +62,7 @@ Given a 3-week timeline and a beginner-to-intermediate-comfort team, the priorit
 | Orchestration | **AirFlow** (open-source, local agent) | Airflow requires standing up a webserver, scheduler, and metadata DB — real operational overhead for a 3-week class project. |
 | Experiment tracking + registry | **MLflow** (local or self-hosted, not the managed service) | Free, no account/API key friction (unlike W&B), and the Model Registry is built in — one tool covers both tracking and registry requirements. `mlflow ui` gives you the dashboard screenshot the rubric wants with zero extra setup. |
 | Deployment | **Docker + FastAPI** | FastAPI over Flask: automatic OpenAPI/Swagger docs (`/docs`) give you a working interactive demo for free, native Pydantic request validation (which also makes injecting "drifted"/malformed requests for the stress test trivial), and async support if inference needs to scale. BentoML adds a real learning curve for marginal benefit at this scope. |
-| Monitoring & drift | **EvidentlyAI** | Purpose-built for exactly this rubric item — one Python call generates an HTML data-drift/model-performance report. Standing up Prometheus + Grafana is a multi-day infra project by itself; Evidently gets you a presentable dashboard in hours. |
+| Monitoring & drift | **Prometheus + Grafana** | Purpose-built for exactly this rubric item — one Python call generates an HTML data-drift/model-performance report.|
 
 ---
 
@@ -149,7 +149,7 @@ Deliverable:
 
 ### Week 3:
 * Docker Containerization & FastAPI Build **Sachin**
-* Model Monitoring - EvidentlyAI **Minhae**
+* Model Monitoring - Prometheus / Grafana **Minhae**
 * Data Drift Work to Validate Monitoring Dashboard **Minhae**
 
 Deliverable: 
