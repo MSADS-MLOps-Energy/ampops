@@ -231,8 +231,12 @@ pushed:
    realized load. `ampops.forecasts` in Postgres (composite PK `(grid_id, target_ts,
    model_version)`) is the substrate a scoring job would join actuals onto, and ad-hoc
    `/predict` traffic is deliberately excluded from it so exploratory calls cannot
-   pollute that future metric — but the job itself, the drift reports, and the retrain
-   trigger are all still stubs.
+   pollute that future metric — but the scoring job, drift detection, and the retrain
+   trigger are all unbuilt. What *does* exist is operational instrumentation:
+   `ampops_prediction_latency_seconds`, `ampops_prediction_mw`, and
+   `ampops_forecast_cache_events_total` are live and scraped every 15s. Those measure the
+   *service* and the *prediction distribution* — none of them measures accuracy, which
+   requires actuals the system does not yet ingest.
 5. **Replay mode caveat.** The daily forecast DAG runs against already-observed weather
    via `AMPOPS_SIMULATED_TODAY`. Any accuracy measured through that path benefits from
    perfect weather knowledge and would overstate live performance, where weather itself

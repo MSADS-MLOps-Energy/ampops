@@ -10,7 +10,7 @@ Predicting electricity demand before the grid has to guess.
 
 Modern electric grids operate under strict frequency balance requirements, and system operators must continuously adjust supply to meet volatile demand. Over-estimating demand forces grids to run expensive, carbon-intensive "peaker" plants; under-estimating demand risks frequency dropouts and blackouts.
 
-AmpOps automates the end-to-end machine learning lifecycle for short-term load forecasting: it ingests raw smart meter and weather telemetry, versions feature data, tracks challenger models, serves day-ahead forecasts from a containerized FastAPI service, and continuously monitors for sensor failure or data drift.
+AmpOps automates the end-to-end machine learning lifecycle for short-term load forecasting: it ingests raw smart meter and weather telemetry, versions feature data, tracks challenger models, and serves day-ahead forecasts from a containerized FastAPI service. Operational monitoring (Prometheus metrics on latency, cache behaviour, and the predicted-load distribution) is instrumented and scraped; sensor-failure and data-drift detection are designed but **not yet built** — see [Monitoring](#monitoring).
 
 Serving latency is measured, not asserted: a scheduled daily batch precomputes the next operating day's 24 hourly forecasts, so cached reads return in roughly **1 ms**, while an on-demand prediction that misses the cache runs live H2O inference at roughly **300 ms** (a pandas frame has to cross into the JVM and back). Both numbers are from the local Docker stack — see `docs/serving_contract.md`.
 
@@ -40,17 +40,33 @@ Upstream Raw Data Ingestion (PJM Grid + Open-Meteo Weather API)
    5. FastAPI + daily forecast DAG       (implemented)
               │
               ▼
-   6. Monitoring / drift / retrain       (stub)
+   6. Monitoring / drift / retrain       (metrics live; drift + retrain not built)
 ```
 
-**Pipeline stages (implemented):**
+**Pipeline stages:**
 
 1. **Data Ingestion & Features** — Raw CSVs in `data/raw/` are cleaned (DST realignment, dedup), joined, and feature-engineered (calendar + horizon-safe lags). Chronological split: final **12 months** sealed as `test.parquet`.
 2. **AutoML & Experiment Tracking** — Airflow (or `make train`) runs an **H2O AutoML** search over algorithms and hyperparameters, logs the leader to MLflow, and scores it on a validation tail. Selection uses `nfolds=0` with an explicit `validation_frame` rather than k-fold, because k-fold would shuffle time-ordered rows and leak future information. Tracking can target **Databricks MLflow** or a local compose MLflow server. Requires Java — see Prerequisites.
 3. **Registry & Holdout** — Champion promotion to `models:/…@champion` (Databricks Unity Catalog when a catalog is configured; soft-fails to a `runs:/` URI otherwise so training still completes), followed by a post-registration evaluation against the sealed test set, tagged onto the registered version.
-4. **Serving** — FastAPI + H2O inference behind a Redis-backed forecast cache and feature store, orchestrated by a daily forecast DAG that precomputes the next operating day and persists to Postgres. Implemented and validated end-to-end in the local Docker stack — see [Serving](#serving) below. Monitoring (Evidently drift detection, actuals-vs-prediction scoring, retrain webhook) is still a stub under `monitoring/`.
+4. **Serving** — FastAPI + H2O inference behind a Redis-backed forecast cache and feature store, orchestrated by a daily forecast DAG that precomputes the next operating day and persists to Postgres. Implemented and validated end-to-end in the local Docker stack — see [Serving](#serving) below.
+5. **Monitoring** — *partially built.* Prometheus metrics are instrumented and scraped (see [Monitoring](#monitoring) below); drift detection, actuals-vs-prediction scoring, and the retrain trigger are **not built yet**.
 
-Full Databricks wiring notes: [`docs/databricks_experiment_tracking.md`](docs/databricks_experiment_tracking.md). Full serving write-up: [`docs/fastapi_serving_layer.md`](docs/fastapi_serving_layer.md); binding serving spec: [`docs/serving_contract.md`](docs/serving_contract.md).
+Full Databricks wiring notes: [`docs/databricks_experiment_tracking.md`](docs/databricks_experiment_tracking.md). Full serving write-up: [`docs/fastapi_serving_layer.md`](docs/fastapi_serving_layer.md); binding serving spec: [`docs/serving_contract.md`](docs/serving_contract.md). System architecture with diagrams: [`docs/system_architecture.md`](docs/system_architecture.md).
+
+## Monitoring
+
+| Piece | Status |
+|---|---|
+| API instrumentation — `prometheus-fastapi-instrumentator` defaults plus `ampops_prediction_latency_seconds` (labelled by `source`), `ampops_prediction_mw`, `ampops_forecast_cache_events_total` | **Implemented** (`app/main.py`) |
+| Prometheus scrape — `api:8000/metrics` every 15s | **Implemented** (`monitoring/prometheus.yml`) |
+| Prometheus + Grafana services under the `serving` compose profile | **Implemented** (`docker-compose.yml`) |
+| Grafana datasource + dashboards | **Not provisioned** — the service runs, but ships no datasource config or dashboard JSON, so a fresh Grafana opens empty |
+| Inference-input logging | **Not built** — `/predict` builds its 49-column frame in memory and discards it; only prediction *values* reach Prometheus, and only batch *outputs* reach Postgres. Input drift cannot be measured until this exists |
+| Data-drift detection | **Not built** — tool choice is still open (Evidently vs. Prometheus/Grafana-only); see `docs/AmpOps_Project_Context.md` §2.3 |
+| Actuals-vs-prediction scoring | **Not built** — needs an actuals source; `ampops.forecasts` is the join substrate |
+| Retrain trigger | **Not built** |
+
+So the stack **observes itself operationally today** (latency, throughput, cache hit rate, predicted-MW distribution) but **does not yet detect data drift**.
 
 ## Evaluation
 
@@ -63,7 +79,9 @@ Each MLflow run also logs the leader's hyperparameters (`hp.*` params plus a `hy
 
 ## Tech Stack
 
-`Python 3.11` · `H2O AutoML` (Java 17) · `scikit-learn` · `Airflow` · `MLflow` (+ Databricks) · `FastAPI` · `Redis` · `Postgres` · `Prometheus` · `Docker` · `Evidently` (planned) · `Ruff` · `pytest`
+`Python 3.11` · `H2O AutoML` (Java 17) · `scikit-learn` · `Airflow` · `MLflow` (+ Databricks) · `FastAPI` · `Redis` · `Postgres` · `Prometheus` · `Grafana` (unprovisioned) · `Docker` · `Ruff` · `pytest`
+
+Drift tooling is an open decision — Evidently is **not** currently a dependency.
 
 ## Getting Started
 

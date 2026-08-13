@@ -308,9 +308,22 @@ profile rather than hanging out a connection timeout. Start it with
 
 ## Known gaps / future work
 
-- The monitoring phase (Grafana runs but ships no provisioned dashboard yet)
-  still needs an actuals source, a prediction-vs-actual scoring job, and the
-  retrain webhook (`README`'s architecture diagram, stage 5/6).
+- **Monitoring is half-built, and the halves are worth separating.** *Built:*
+  `prometheus-fastapi-instrumentator` defaults plus three purpose-chosen series
+  (`ampops_prediction_latency_seconds` labelled by `source`,
+  `ampops_prediction_mw`, `ampops_forecast_cache_events_total`), scraped every
+  15s by `monitoring/prometheus.yml`, with Prometheus and Grafana both in the
+  `serving` profile. *Not built:* Grafana ships no datasource or dashboard JSON
+  (a fresh container opens empty), and there is no drift detection, no actuals
+  source, no prediction-vs-actual scoring job, and no retrain trigger.
+- **No inference inputs are persisted anywhere, which blocks input-drift work
+  entirely.** `build_inference_frame` assembles 49 columns in memory, hands them
+  to H2O, and drops them; the only trace a request leaves is a bucketed
+  observation in `ampops_prediction_mw` (the *output*) and, for batch calls, the
+  predicted value in `ampops.forecasts`. Any drift tooling — Evidently, a
+  hand-rolled PSI job, or Grafana panels over per-feature histograms — needs the
+  input distribution, so a feature-logging sink is the prerequisite for all
+  three, not a detail of one.
 - Ad-hoc `/predict` calls are deliberately not persisted to Postgres — only
   scheduled batches are, to keep the accuracy metric the retrain webhook will
   key off unpolluted by exploratory traffic.

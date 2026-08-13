@@ -363,9 +363,17 @@ the diagnostic signal that the champion did not load.
 ### `GET /metrics`
 
 `prometheus-fastapi-instrumentator` defaults, plus:
-- a prediction-latency histogram, labelled by `source`
-- a prediction-value histogram (feeds future drift detection)
-- a cache hit/miss counter
+- `ampops_prediction_latency_seconds` — latency histogram, labelled by `source`
+  (`cache` vs `live`), so the ~1.3ms and ~300–530ms paths stay separable
+- `ampops_prediction_mw` — prediction-value histogram, 8 explicit buckets from
+  6,000 to 24,000 MW
+- `ampops_forecast_cache_events_total` — cache hit/miss counter
+
+All three are **implemented and scraped** (`monitoring/prometheus.yml`, 15s interval).
+Note what they are and are not: these describe the *output* and the *service*, never the
+*input*. `ampops_prediction_mw` supports prediction-drift monitoring on its own, but
+input/feature drift needs the 49-column frame persisted somewhere, and nothing persists
+it today. Grafana is running but unprovisioned — no datasource, no dashboards.
 
 ### Error codes
 

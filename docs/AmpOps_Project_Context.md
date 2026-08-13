@@ -62,7 +62,16 @@ Given a 3-week timeline and a beginner-to-intermediate-comfort team, the priorit
 | Orchestration | **AirFlow** (open-source, local agent) | Airflow requires standing up a webserver, scheduler, and metadata DB — real operational overhead for a 3-week class project. |
 | Experiment tracking + registry | **MLflow** (local or self-hosted, not the managed service) | Free, no account/API key friction (unlike W&B), and the Model Registry is built in — one tool covers both tracking and registry requirements. `mlflow ui` gives you the dashboard screenshot the rubric wants with zero extra setup. |
 | Deployment | **Docker + FastAPI** | FastAPI over Flask: automatic OpenAPI/Swagger docs (`/docs`) give you a working interactive demo for free, native Pydantic request validation (which also makes injecting "drifted"/malformed requests for the stress test trivial), and async support if inference needs to scale. BentoML adds a real learning curve for marginal benefit at this scope. |
-| Monitoring & drift | **Prometheus + Grafana** | Purpose-built for exactly this rubric item — one Python call generates an HTML data-drift/model-performance report.|
+| Monitoring & drift | **Prometheus + Grafana for operational metrics — decided and built.** Drift-detection tooling **still open**: Evidently vs. Prometheus/Grafana-only. | Prometheus/Grafana were chosen for operational telemetry and are live (scrape config, three custom series, both services in the `serving` profile). **Note the stale justification this row used to carry:** "one Python call generates an HTML data-drift report" describes *Evidently*, not Grafana — the tool name was swapped at some point without updating the reasoning, and §9's Week 3 rows still disagree with each other (tasks say Prometheus/Grafana, deliverable says "EvidentlyAI built and deployed"). Grafana can *display* drift but cannot *compute* a per-feature statistical test; see the analysis below. |
+
+> **Open decision — drift tooling.** Grafana renders time series out of Prometheus; it does
+> not compute PSI/KS/Wasserstein, cannot see schema drift or null-flooding (§5's scenarios),
+> and would need ~49 hand-built panels plus hand-rolled PSI in PromQL to approximate
+> per-feature input drift. Evidently computes all of that in one call but adds a heavyweight
+> dependency. **A prerequisite blocks both options equally:** the API currently persists no
+> inference inputs — `/predict` builds its 49-column frame in memory and discards it — so
+> there is nothing for either tool to compare against a training reference. Feature logging
+> has to land first regardless of which tool wins.
 
 ---
 
@@ -73,7 +82,7 @@ The four required lifecycle stages map cleanly onto four workstreams — confirm
 1. **Data & Features** — clean and join the two source datasets, resolve the overlap window, build the feature pipeline, own the train/test split logic.
 2. **Pipeline & Experimentation** — Prefect flow for orchestration, MLflow tracking, the model bake-off, and registering the winning model to the Model Registry.
 3. **Deployment** — Dockerfile, FastAPI inference service, request/response schema (Pydantic), containerized smoke tests.
-4. **Monitoring & Drift** — Evidently baseline report against the clean test set, design and inject the corrupted/drifted dataset, capture before/after evidence for the presentation.
+4. **Monitoring & Drift** — baseline drift report against the clean test set, design and inject the corrupted/drifted dataset, capture before/after evidence for the presentation. *Status (2026-08-13): operational Prometheus metrics and the scrape config are built; the drift half is not started, and the reporting tool is still an open decision (see §2.3).*
 
 Each workstream should agree on the **data contract** (schema of the joined dataset, and the API request/response schema) before splitting up, so integration in week 3 isn't a surprise.
 
@@ -88,7 +97,9 @@ The rubric asks for artificially corrupted data that mimics real field failure m
 - **Schema drift:** drop a column the model expects, or rename it, to mimic an upstream schema change.
 - **Sensor dropout:** null-flood a subset of rows in one weather field to mimic a failed smart meter/sensor feed.
 
-Feed each scenario through the deployed API and capture what Evidently flags (or doesn't) — the contrast between "silently wrong prediction" and "flagged by monitoring" is the strongest part of the demo.
+Feed each scenario through the deployed API and capture what the monitoring layer flags (or doesn't) — the contrast between "silently wrong prediction" and "flagged by monitoring" is the strongest part of the demo.
+
+**Not yet implemented, and a tooling constraint worth knowing before choosing.** Two of the four scenarios above — *schema drift* (dropped/renamed column) and *sensor dropout* (null flooding) — are **invisible to Prometheus/Grafana** unless someone explicitly instruments a counter for each failure mode, because Prometheus only stores aggregates that were exported on purpose. A statistical drift library detects both from the data itself. This asymmetry, not dashboard aesthetics, is the real basis for the §2.3 tool decision.
 
 ---
 
@@ -121,7 +132,7 @@ Feed each scenario through the deployed API and capture what Evidently flags (or
 - [X] Role assignment across the 4 workstreams above (today's meeting)
 - [X] Confirm MAPE/RMSE as the metric pair, or substitute if the team prefers something else
 - [ ] Decide whether to keep any daily-aggregate weather features or discard that block entirely
-- [X] Confirm Prefect/MLflow/FastAPI/Evidently stack, or flag if anyone has a strong reason to deviate
+- [X] Confirm Prefect/MLflow/FastAPI/Evidently stack, or flag if anyone has a strong reason to deviate — *two of the four changed after this was ticked: orchestration shipped as **Airflow**, not Prefect, and the **Evidently decision was never actually settled** (see §2.3). MLflow and FastAPI stand as chosen.*
 - [ ] Finalize the shared data contract (joined dataset schema + API request/response schema) before workstreams diverge
 - [ ] Confirm the DST-realignment approach (fixed-offset conversion) holds up under the hour-of-day sanity check once implemented.
 - [X] **COMED timezone interpretation — RESOLVED.** The two sources are one hour apart in summer and aligned in winter; the notebook's realignment had it backwards. `config.TIMEZONE_STRATEGY` now defaults to `"eastern"` (summer −1h). Every bake-off model improved: XGBoost 4.45% → 4.18% MAPE. See `docs/timezone_alignment_finding.md`. **Anyone holding a pre-correction `data/processed/*.parquet` must regenerate it.**
@@ -153,8 +164,8 @@ Deliverable:
 * Data Drift Work to Validate Monitoring Dashboard **Minhae**
 
 Deliverable: 
-1. Docker Container & FastAPI deployed 
-2. EvidentlyAI built and deployed
+1. Docker Container & FastAPI deployed — **done** (see `docs/fastapi_serving_layer.md`)
+2. ~~EvidentlyAI built and deployed~~ — **not done, and the tool is no longer settled.** The task rows above name Prometheus/Grafana while this deliverable names Evidently; §2.3 now carries the open decision. What *is* deployed: Prometheus scraping the API's three custom series, plus a Grafana service with no provisioned datasource or dashboard. Drift detection itself is unstarted.
 
 ### Week 4: 
 * Final Presentation Deck **Team**
