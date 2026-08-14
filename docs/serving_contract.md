@@ -27,6 +27,13 @@ dtype does not raise — H2O silently infers a different column type (a numeric 
 arriving as a string becomes an `enum`) and predictions degrade in a way that looks
 plausible. **The API owns 100% of schema correctness.**
 
+(One exception: the copy of the champion migrated into Databricks Unity Catalog via
+`scripts/migrate_champion_to_databricks.py` *does* carry an inferred signature — UC
+registration requires one. That's a property of this specific migrated version, not of
+`run_h2o_automl`'s normal training path above, which still logs no signature. Any future
+model produced by a real `make train`/DAG run reintroduces the no-signature gap this
+section warns about — don't assume signature enforcement going forward.)
+
 The column set is defined by `ampops.features.build.feature_columns(df)`, which is
 derived, not hardcoded: *everything except `time` and `COMED_MW`*.
 
@@ -508,6 +515,7 @@ the first real request is not an outlier.
 | `AIRFLOW_CONN_AMPOPS_DB` | `postgresql://airflow:airflow@postgres/ampops` | DAG's Postgres connection |
 | `MLFLOW_TRACKING_URI` | `databricks` | Existing |
 | `MLFLOW_REGISTRY_URI` | `databricks-uc` | Existing |
+| `AMPOPS_UC_MODEL_PREFIX` | `workspace.default` | UC catalog.schema prefix applied by `config.resolve_registered_model_name` |
 
 ---
 

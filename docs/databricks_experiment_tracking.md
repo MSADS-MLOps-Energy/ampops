@@ -28,8 +28,26 @@ MLFLOW_REGISTRY_URI=databricks-uc
 DATABRICKS_HOST=https://<workspace>.cloud.databricks.com
 DATABRICKS_TOKEN=<pat>
 AMPOPS_MODEL_NAME=ampops-demand-forecaster
-# AMPOPS_UC_MODEL_PREFIX=catalog.schema   # if name is not already 3-level
+AMPOPS_UC_MODEL_PREFIX=workspace.default   # or your own catalog.schema
 ```
+
+`workspace.default` is the schema every Databricks workspace auto-creates, so
+it's a safe default with no provisioning step. `.env`/`.env.example` structure
+this as two mutually-exclusive blocks (Databricks active / local commented
+out, or vice versa) — see the comment header in either file before editing.
+
+---
+
+## Status: confirmed working end-to-end (2026-08-14)
+
+`workspace.default.ampops-demand-forecaster` is registered in this
+workspace's Unity Catalog with the `@champion` alias resolving to v1 — not a
+soft-fail fallback. It was migrated in from the local-compose champion
+(v5, `drf`) via `scripts/migrate_champion_to_databricks.py` rather than
+retrained, so its metrics match the local run exactly (`mape=0.042276`,
+`test_mape=0.030125`); the version tags include `source_run_id` and
+`migrated_from=local-compose` for provenance. The FastAPI serving layer
+(`docs/fastapi_serving_layer.md`) loads it directly from this workspace.
 
 ---
 

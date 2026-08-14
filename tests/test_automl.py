@@ -90,6 +90,21 @@ def test_run_h2o_automl_returns_a_valid_champion_scorecard(
     # Local .venv's mlflow (3.15.1) refuses a bare file-store tracking URI
     # without this env var; Build hit the same thing in their smoke test.
     monkeypatch.setenv("MLFLOW_ALLOW_FILE_STORE", "true")
+    # config.MLFLOW_REGISTRY_URI defaults to "databricks-uc" independent of
+    # tracking_uri (see _configure_mlflow) -- without clearing it here,
+    # register_champion below would try to register this unsigned synthetic
+    # model against real Unity Catalog instead of the isolated file store.
+    # Clear the env var too: mlflow resolves MLFLOW_REGISTRY_URI from the
+    # environment on its own whenever our code doesn't explicitly call
+    # mlflow.set_registry_uri(), so a caller with .env already sourced (e.g.
+    # a real Databricks token exported for other tooling) would otherwise
+    # leak through regardless of the config.py patch above.
+    monkeypatch.setattr(config, "MLFLOW_REGISTRY_URI", "")
+    monkeypatch.delenv("MLFLOW_REGISTRY_URI", raising=False)
+    # Same leakage risk for the UC prefix: resolve_registered_model_name()
+    # would otherwise prefix this plain test name with AMPOPS_UC_MODEL_PREFIX
+    # whenever a caller has .env sourced.
+    monkeypatch.setattr(config, "UC_MODEL_PREFIX", "")
 
     result = automl.run_h2o_automl(
         synthetic_train_path,

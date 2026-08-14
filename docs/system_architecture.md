@@ -353,7 +353,7 @@ the containers.
 | `MLFLOW_TRACKING_URI` | `databricks` | Tracking backend |
 | `MLFLOW_REGISTRY_URI` | `databricks-uc` | Registry backend |
 | `AMPOPS_MODEL_NAME` | `ampops-demand-forecaster` | Registered model name |
-| `AMPOPS_UC_MODEL_PREFIX` | — | `catalog.schema` prefix for Unity Catalog |
+| `AMPOPS_UC_MODEL_PREFIX` | `workspace.default` | `catalog.schema` prefix for Unity Catalog |
 | `AMPOPS_STORE_BACKEND` | `redis` | Feature store + cache pair |
 | `AMPOPS_SERVING_MODEL_URI` | `models:/…@champion` | Override what serving loads |
 | `AMPOPS_API_URL` | `http://api:8000` | Where the forecast DAG posts |
@@ -393,7 +393,7 @@ Each of these shows up as a structural feature in one of the diagrams:
 | Ingestion, cleaning, DST realignment, join | **Implemented** | Shape gate 66,493 x 32 passes every run |
 | Feature engineering, chronological split | **Implemented** | Leakage test perturbs the forbidden window, asserts no feature moves |
 | H2O AutoML search | **Implemented** | Validated in the real compose stack, not just a venv |
-| MLflow tracking + registry promotion | **Implemented** | `@champion` resolves to v5 (`drf`) |
+| MLflow tracking + registry promotion | **Implemented** | Databricks UC `workspace.default.ampops-demand-forecaster`, `@champion` resolves to v1 (`drf`, migrated from local v5) |
 | Sealed-holdout evaluation | **Implemented** | `test_mape` / `test_rmse` / `test_mae` on the version |
 | FastAPI serving | **Implemented** | 106 passed / 5 skipped; ruff clean |
 | Daily forecast DAG + Postgres persistence | **Implemented** | Runs end-to-end, idempotent upsert verified |

@@ -50,7 +50,14 @@ was enabled with 3 catalogs. Two separate, hard blockers were found:
 **Conclusion:** this is a product-tier limitation, not a configuration
 mistake. Real Databricks AutoML cannot run on Databricks Free Edition as it
 exists today, regardless of how the job or auth is configured. Databricks
-credentials have since been removed from the local `.env`.
+credentials were removed from the local `.env` at the time.
+
+This conclusion is only about Databricks **AutoML** (the model-search
+service) and remains true. It's a separate question from Databricks
+**MLflow/Unity Catalog as the tracking/registry backend**, which the project
+later adopted anyway — H2O AutoML still does all the model search in-process;
+Databricks is only where results get tracked and registered. See
+`docs/databricks_experiment_tracking.md`.
 
 ## The H2O approach (as built)
 
@@ -140,11 +147,18 @@ Step by step:
    but MAPE — the project's headline metric — is still computed and reported
    the same way it always was.
 
-5. **Log.** The winning model is logged via `mlflow.h2o.log_model()`
-   directly to the project's existing local, self-hosted MLflow tracking
-   server (`http://mlflow:5000` in Docker, experiment
-   `ampops-demand-forecasting`) — no cross-service artifact bridging needed,
-   unlike what the earlier, abandoned Databricks design would have required.
+5. **Log.** The winning model is logged via `mlflow.h2o.log_model()` to
+   whichever MLflow tracking server `MLFLOW_TRACKING_URI` points at — the
+   project's self-hosted local compose server (`http://mlflow:5000`,
+   experiment `ampops-demand-forecasting`) was the original default and
+   remains a supported fallback, but Databricks MLflow is now the active
+   default (`docs/databricks_experiment_tracking.md`). This is unrelated to
+   the abandoned Databricks *AutoML* design above (§"Why not Databricks") —
+   H2O still does the actual model search in-process either way; only the
+   tracking/registry destination changed. The v5 champion described below was
+   originally logged to the local server and later migrated into Databricks
+   Unity Catalog via `scripts/migrate_champion_to_databricks.py`, without a
+   retrain.
 
 6. **Return.** Yields:
    ```python
