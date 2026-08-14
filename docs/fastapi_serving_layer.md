@@ -294,8 +294,10 @@ profile rather than hanging out a connection timeout. Start it with
 2. `MLFLOW_REGISTRY_URI` silently reverts to `databricks-uc` if merely
    commented out in `.env` — `docker-compose.yml` uses
    `${MLFLOW_REGISTRY_URI:-databricks-uc}`, and `:-` substitutes the default
-   for both "unset" and "empty." Set it explicitly for local serving:
-   `MLFLOW_REGISTRY_URI=http://mlflow:5000`.
+   for both "unset" and "empty." `databricks-uc` is now the intended default,
+   so this is only a trap when running the **local fallback**: set it
+   explicitly to `MLFLOW_REGISTRY_URI=http://mlflow:5000` there, not left
+   commented out (see the toggle structure documented in `.env`).
 3. The VirtioFS `errno 35` deadlock (`docs/virtiofs_errno35_deadlock.md`) is
    broader than its original data-only writeup: during validation it also
    hit `app/`+`src/` bind mounts (a Python import failing in the api
@@ -331,6 +333,10 @@ profile rather than hanging out a connection timeout. Start it with
   live forecasting means pointing `openmeteo-requests` at Open-Meteo's
   forecast API instead of the archive API and feeding results into the
   feature store on a schedule.
-- Databricks-backed end-to-end validation (as opposed to local compose) is
-  still pending a workspace URL; the `.env` switch is already staged and
-  commented out.
+- **Databricks-backed end-to-end validation is complete (2026-08-14).** The
+  champion (`workspace.default.ampops-demand-forecaster` v1, migrated from the
+  local v5 run via `scripts/migrate_champion_to_databricks.py`, same weights
+  and metrics) is now what `.env` points at by default; `/ready` loads it from
+  Databricks Unity Catalog and reports `model_uri:
+  models:/workspace.default.ampops-demand-forecaster@champion`. Local compose
+  MLflow remains a supported, documented fallback (`docs/databricks_experiment_tracking.md`), not the default.

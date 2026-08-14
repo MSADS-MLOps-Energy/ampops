@@ -90,7 +90,7 @@ Drift tooling is an open decision — Evidently is **not** currently a dependenc
 - **Python 3.11** (conda env `ampops` or `make setup` → `.venv`)
 - **Java 17** — H2O spawns a JVM, so `make train` and the serving API both need it. macOS: `brew install openjdk@17` (keg-only; the Makefile adds it to `PATH` automatically). H2O 3.46.x supports Java 8–17 — **21 is not supported**.
 - Docker & Docker Compose (optional — for the full Airflow stack)
-- Databricks workspace + PAT (optional — for cloud experiment tracking)
+- Databricks workspace + PAT — required for the default backend (Databricks MLflow/Unity Catalog); optional only if you switch `.env` to the local compose MLflow fallback
 
 ### Getting the data
 
@@ -109,7 +109,7 @@ Everything under `data/interim/` and `data/processed/` is generated — never co
 cp .env.example .env
 ```
 
-**Databricks (recommended for the course demo):**
+**Databricks (default, and where the champion actually lives):**
 
 ```env
 MLFLOW_TRACKING_URI=databricks
@@ -118,10 +118,15 @@ DATABRICKS_HOST=https://<workspace>.cloud.databricks.com
 DATABRICKS_TOKEN=<pat>
 MLFLOW_REGISTRY_URI=databricks-uc
 AMPOPS_MODEL_NAME=ampops-demand-forecaster
-# AMPOPS_UC_MODEL_PREFIX=catalog.schema   # if your UC catalog is not main.default
+AMPOPS_UC_MODEL_PREFIX=workspace.default   # or your own catalog.schema, if you have one
 ```
 
-**Local compose MLflow:** leave `MLFLOW_TRACKING_URI=http://mlflow:5000` (Airflow) / use `http://localhost:5050` in the browser.
+`.env`/`.env.example` structure this as two mutually-exclusive blocks — exactly
+one may have uncommented `KEY=VALUE` lines, since dotenv/docker-compose
+parsing is last-key-wins and silently picks whichever block is uncommented
+last if both are ever active at once.
+
+**Local compose MLflow (fallback):** comment out the Databricks block above and uncomment `MLFLOW_TRACKING_URI=http://mlflow:5000` / `MLFLOW_REGISTRY_URI=http://mlflow:5000` instead (Airflow) — browse it at `http://localhost:5050`.
 
 ### Fast path: local data + train → Databricks
 
@@ -153,7 +158,7 @@ make airflow-up                # postgres, MLflow, Airflow
 | Service | URL | Credentials |
 |---|---|---|
 | Airflow UI | http://localhost:8080 | `admin` / `admin` |
-| Local MLflow UI | http://localhost:5050 | — (unused if tracking URI is `databricks`) |
+| Local MLflow UI | http://localhost:5050 | — (fallback only; unused while tracking URI is `databricks`, the default) |
 
 Trigger **`ampops_training_pipeline`** in the UI or:
 
