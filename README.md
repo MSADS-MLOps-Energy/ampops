@@ -10,7 +10,7 @@ Predicting electricity demand before the grid has to guess.
 
 Modern electric grids operate under strict frequency balance requirements, and system operators must continuously adjust supply to meet volatile demand. Over-estimating demand forces grids to run expensive, carbon-intensive "peaker" plants; under-estimating demand risks frequency dropouts and blackouts.
 
-AmpOps automates the end-to-end machine learning lifecycle for short-term load forecasting: it ingests raw smart meter and weather telemetry, versions feature data, tracks challenger models, and serves day-ahead forecasts from a containerized FastAPI service. Operational monitoring (Prometheus metrics on latency, cache behaviour, and the predicted-load distribution) is instrumented and scraped; sensor-failure and data-drift detection are designed but **not yet built** — see [Monitoring](#monitoring).
+AmpOps automates the end-to-end machine learning lifecycle for short-term load forecasting: it ingests raw smart meter and weather telemetry, versions feature data, tracks challenger models, and serves day-ahead forecasts from a containerized FastAPI service. Operational monitoring is implemented with Prometheus and Grafana, including API latency, cache behaviour, predicted-load metrics, and custom PSI-based input-drift detection. A rolling inference window is compared with a known-good reference distribution, and Grafana surfaces both overall drift status and per-feature PSI scores — see [Monitoring](#monitoring).
 
 Serving latency is measured, not asserted: a scheduled daily batch precomputes the next operating day's 24 hourly forecasts, so cached reads return in roughly **1 ms**, while an on-demand prediction that misses the cache runs live H2O inference at roughly **300 ms** (a pandas frame has to cross into the JVM and back). Both numbers are from the local Docker stack — see `docs/serving_contract.md`.
 
@@ -40,7 +40,7 @@ Upstream Raw Data Ingestion (PJM Grid + Open-Meteo Weather API)
    5. FastAPI + daily forecast DAG       (implemented)
               │
               ▼
-   6. Monitoring / drift / retrain       (metrics live; drift + retrain not built)
+   6. Monitoring / drift                 (Prometheus + Grafana + PSI implemented)
 ```
 
 **Pipeline stages:**
@@ -49,24 +49,147 @@ Upstream Raw Data Ingestion (PJM Grid + Open-Meteo Weather API)
 2. **AutoML & Experiment Tracking** — Airflow (or `make train`) runs an **H2O AutoML** search over algorithms and hyperparameters, logs the leader to MLflow, and scores it on a validation tail. Selection uses `nfolds=0` with an explicit `validation_frame` rather than k-fold, because k-fold would shuffle time-ordered rows and leak future information. Tracking can target **Databricks MLflow** or a local compose MLflow server. Requires Java — see Prerequisites.
 3. **Registry & Holdout** — Champion promotion to `models:/…@champion` (Databricks Unity Catalog when a catalog is configured; soft-fails to a `runs:/` URI otherwise so training still completes), followed by a post-registration evaluation against the sealed test set, tagged onto the registered version.
 4. **Serving** — FastAPI + H2O inference behind a Redis-backed forecast cache and feature store, orchestrated by a daily forecast DAG that precomputes the next operating day and persists to Postgres. Implemented and validated end-to-end in the local Docker stack — see [Serving](#serving) below.
-5. **Monitoring** — *partially built.* Prometheus metrics are instrumented and scraped (see [Monitoring](#monitoring) below); drift detection, actuals-vs-prediction scoring, and the retrain trigger are **not built yet**.
+5. **Monitoring & Drift Detection** — Prometheus scrapes operational and drift metrics from FastAPI, while a custom PSI monitor evaluates a rolling 168-hour inference window across eight weather and load-history features. Grafana is provisioned with an AmpOps monitoring dashboard showing overall drift status and per-feature PSI. Controlled temperature and humidity corruption scenarios are provided for drift validation.
 
 Full Databricks wiring notes: [`docs/databricks_experiment_tracking.md`](docs/databricks_experiment_tracking.md). Full serving write-up: [`docs/fastapi_serving_layer.md`](docs/fastapi_serving_layer.md); binding serving spec: [`docs/serving_contract.md`](docs/serving_contract.md). System architecture with diagrams: [`docs/system_architecture.md`](docs/system_architecture.md).
 
 ## Monitoring
 
+AmpOps uses **Prometheus + Grafana** for operational monitoring and a custom
+**Population Stability Index (PSI)** detector for inference-input drift.
+
+### Operational monitoring
+
+FastAPI exposes Prometheus metrics at `/metrics`, including request metrics and
+AmpOps-specific prediction, cache, and drift measurements. Prometheus scrapes
+the API every 15 seconds and Grafana is automatically provisioned with the
+Prometheus datasource and the `AmpOps Monitoring` dashboard.
+
 | Piece | Status |
 |---|---|
-| API instrumentation — `prometheus-fastapi-instrumentator` defaults plus `ampops_prediction_latency_seconds` (labelled by `source`), `ampops_prediction_mw`, `ampops_forecast_cache_events_total` | **Implemented** (`app/main.py`) |
-| Prometheus scrape — `api:8000/metrics` every 15s | **Implemented** (`monitoring/prometheus.yml`) |
-| Prometheus + Grafana services under the `serving` compose profile | **Implemented** (`docker-compose.yml`) |
-| Grafana datasource + dashboards | **Not provisioned** — the service runs, but ships no datasource config or dashboard JSON, so a fresh Grafana opens empty |
-| Inference-input logging | **Not built** — `/predict` builds its 49-column frame in memory and discards it; only prediction *values* reach Prometheus, and only batch *outputs* reach Postgres. Input drift cannot be measured until this exists |
-| Data-drift detection | **Not built** — tool choice is still open (Evidently vs. Prometheus/Grafana-only); see `docs/AmpOps_Project_Context.md` §2.3 |
-| Actuals-vs-prediction scoring | **Not built** — needs an actuals source; `ampops.forecasts` is the join substrate |
-| Retrain trigger | **Not built** |
+| FastAPI / Prometheus instrumentation | **Implemented** |
+| Prometheus scrape (`api:8000/metrics`) | **Implemented** |
+| Grafana datasource provisioning | **Implemented** |
+| Grafana `AmpOps Monitoring` dashboard | **Implemented** |
+| PSI input-drift detection | **Implemented** |
+| Controlled drift simulation | **Implemented** |
+| Actuals-vs-prediction monitoring | **Not yet implemented** |
+| Automatic retraining trigger | **Not yet implemented** |
 
-So the stack **observes itself operationally today** (latency, throughput, cache hit rate, predicted-MW distribution) but **does not yet detect data drift**.
+### Input-drift detection
+
+The deployed API maintains a rolling **168-hour inference window** and evaluates
+eight model inputs against a known-good reference distribution:
+
+- `temperature_2m`
+- `relative_humidity_2m`
+- `precipitation`
+- `wind_speed_10m`
+- `load_lag_24h`
+- `load_lag_168h`
+- `load_roll_mean_24h`
+- `load_roll_std_24h`
+
+The reference baseline is generated from the first 168 hours of the sealed
+test period and stored in `monitoring/drift_baseline.json`. This fixed window is
+used as a controlled validation baseline; it is not intended to represent a
+season-aware long-term production baseline.
+
+PSI interpretation:
+
+| PSI | Status |
+|---|---|
+| `< 0.10` | Normal |
+| `0.10 – < 0.25` | Warning |
+| `>= 0.25` | Alert |
+
+The API exports:
+
+- `ampops_drift_psi{feature="..."}` — PSI for each monitored feature
+- `ampops_drift_alert` — `1` when at least one feature is in alert
+- `ampops_drift_alert_features` — number of features in alert
+- `ampops_drift_window_rows` — rows collected in the rolling window
+
+### Baseline validation
+
+The clean reference window is replayed through the deployed `/predict/batch`
+endpoint as seven normal 24-hour day-ahead batches. Once all 168 inference rows
+have been collected, the clean distribution produces PSI values approximately
+equal to zero and Grafana reports **NORMAL**.
+
+This validates the monitoring path end-to-end:
+
+```text
+clean held-out test window
+        ↓
+deployed FastAPI model
+        ↓
+rolling inference monitor
+        ↓
+Prometheus drift metrics
+        ↓
+Grafana: NORMAL
+```
+
+### Stress-test / drift simulation
+
+`scripts/simulate_drift.py` provides two controlled corruption scenarios against
+the same 168-hour test window:
+
+```bash
+# Large distribution shift
+python scripts/simulate_drift.py --apply temperature
+
+# Physically invalid / out-of-bounds values
+python scripts/simulate_drift.py --apply humidity
+
+# Restore the Redis feature store after either simulation
+python scripts/simulate_drift.py --restore
+```
+
+The temperature scenario adds **+25 °C** to `temperature_2m`. In validation,
+its PSI increased to approximately **12.4**, while the unchanged monitored
+features remained near zero.
+
+The humidity scenario sets `relative_humidity_2m` to **150%**, an intentionally
+invalid sensor value. Its PSI increased to approximately **11.9**, while
+temperature and the other unchanged monitored features remained near zero.
+
+In both stress tests:
+
+```text
+corrupted Redis feature
+        ↓
+same deployed /predict/batch API
+        ↓
+PSI identifies the changed feature
+        ↓
+ampops_drift_alert = 1
+        ↓
+Grafana: ALERT
+```
+
+This demonstrates that drift detection is not hard-coded to a single feature:
+the same monitor identifies whichever monitored input distribution is changed.
+
+### Rebuilding the baseline
+
+The committed baseline can be regenerated from `data/processed/test.parquet`:
+
+```bash
+python scripts/build_drift_baseline.py
+```
+
+### Monitoring limitations
+
+The current PSI reference is intentionally fixed to a known-good test window
+for reproducible drift validation. Electricity demand and weather are strongly
+seasonal, so a long-running production deployment should use season-aware or
+context-matched reference distributions.
+
+The system currently detects **input/data drift** and operational anomalies.
+It does not yet compute live forecast error such as MAPE/MAE after actual load
+becomes available, and drift alerts do not automatically trigger retraining.
 
 ## Evaluation
 
@@ -78,10 +201,7 @@ So the stack **observes itself operationally today** (latency, throughput, cache
 Each MLflow run also logs the leader's hyperparameters (`hp.*` params plus a `hyperparams.json` artifact) and wall-clock timing so runs can be compared and re-executed. Test-set metrics are written back onto the registered model version as `test_mape` / `test_rmse` / `test_mae` tags.
 
 ## Tech Stack
-
-`Python 3.11` · `H2O AutoML` (Java 17) · `scikit-learn` · `Airflow` · `MLflow` (+ Databricks) · `FastAPI` · `Redis` · `Postgres` · `Prometheus` · `Grafana` (unprovisioned) · `Docker` · `Ruff` · `pytest`
-
-Drift tooling is an open decision — Evidently is **not** currently a dependency.
+`Python 3.11` · `H2O AutoML` (Java 17) · `scikit-learn` · `Airflow` · `MLflow` (+ Databricks) · `FastAPI` · `Redis` · `Postgres` · `Prometheus` · `Grafana` · `PSI drift monitoring` · `Docker` · `Ruff` · `pytest`
 
 ## Getting Started
 
@@ -250,12 +370,24 @@ ampops/
 │   ├── store.py                 # FeatureStore / ForecastCache (Redis + parquet/in-memory backends)
 │   ├── schemas.py               # request/response Pydantic models
 │   └── config.py                # env-driven Settings, not memoized
-├── monitoring/
-│   └── prometheus.yml           # scrape config for the api service
-├── scripts/
-│   ├── run_pipeline_local.py  # data stages without Airflow
-│   ├── run_training.py        # AutoML + holdout CLI (make train)
-│   └── seed_redis.py           # load joined_hourly.parquet into the Redis feature store
+monitoring/
+  prometheus.yml
+  drift.py
+  drift_baseline.json
+  grafana/
+    dashboards/
+      ampops-monitoring.json
+    provisioning/
+      dashboards/
+      datasources/
+
+scripts/
+  run_pipeline_local.py
+  run_training.py
+  seed_redis.py
+  build_drift_baseline.py
+  simulate_drift.py
+
 ├── notebooks/                 # EDA
 ├── tests/
 ├── docs/

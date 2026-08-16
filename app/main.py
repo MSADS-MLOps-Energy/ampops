@@ -32,7 +32,7 @@ from datetime import date as date_type
 import pandas as pd
 from fastapi import Depends, FastAPI, HTTPException, Query, Request
 from fastapi.responses import JSONResponse
-from prometheus_client import Counter, Histogram
+from prometheus_client import Counter, Gauge, Histogram
 from prometheus_fastapi_instrumentator import Instrumentator
 
 from ampops.utils.io import get_logger
@@ -53,6 +53,7 @@ from app.store import (
     build_feature_store,
     build_forecast_cache,
 )
+from monitoring.drift import RollingDriftMonitor
 
 logger = get_logger(__name__)
 
@@ -75,7 +76,26 @@ CACHE_EVENTS = Counter(
     "Forecast-cache lookups on /predict",
     labelnames=("result",),
 )
+DRIFT_PSI = Gauge(
+    "ampops_drift_psi",
+    "PSI drift score for each monitored inference feature",
+    labelnames=("feature",),
+)
 
+DRIFT_ALERT = Gauge(
+    "ampops_drift_alert",
+    "Whether feature drift is currently detected: 1=yes, 0=no",
+)
+
+DRIFT_ALERT_FEATURES = Gauge(
+    "ampops_drift_alert_features",
+    "Number of monitored features currently in drift alert state",
+)
+
+DRIFT_WINDOW_ROWS = Gauge(
+    "ampops_drift_window_rows",
+    "Number of inference rows currently collected for drift monitoring",
+)
 # One instrumentator for the process, matching the metrics above. The library
 # tolerates a duplicate registration by dropping the second app's default
 # metrics, so sharing the instance is the only way every app instruments the
@@ -96,7 +116,7 @@ def create_app() -> FastAPI:
             settings.store_backend, settings.redis_url, settings.parquet_path
         )
         app.state.cache = build_forecast_cache(settings.store_backend, settings.redis_url)
-
+        app.state.drift_monitor = RollingDriftMonitor(window_size=168)
         # A JVM that will not start is reported through /ready, not by dying at
         # boot: the model load below fails on its own in that case and records
         # why, and a crashed container tells an operator far less than a 503
@@ -123,6 +143,23 @@ def create_app() -> FastAPI:
     _register_routes(app)
     INSTRUMENTATOR.instrument(app).expose(app, include_in_schema=False)
     return app
+
+
+def _observe_drift(app: FastAPI, frame: pd.DataFrame) -> None:
+    """Record inference features and publish rolling drift state to Prometheus."""
+    result = app.state.drift_monitor.observe(frame)
+
+    DRIFT_WINDOW_ROWS.set(result["rows"])
+
+    if not result["ready"]:
+        return
+
+    for feature, info in result["features"].items():
+        if info["psi"] is not None:
+            DRIFT_PSI.labels(feature=feature).set(info["psi"])
+
+    DRIFT_ALERT.set(1 if result["drift_detected"] else 0)
+    DRIFT_ALERT_FEATURES.set(result["alert_count"])
 
 
 def _warm_up(app: FastAPI) -> None:
@@ -230,6 +267,7 @@ def _register_routes(app: FastAPI) -> None:
             source = "live"
             champion: ChampionModel = app.state.champion
             frame = build_inference_frame(app.state.store, payload.grid_id, [ts])
+            _observe_drift(app, frame)
             value = float(champion.predict(frame)[0])
             model_version = champion.version or "unknown"
             CACHE_EVENTS.labels(result="miss").inc()
@@ -256,6 +294,7 @@ def _register_routes(app: FastAPI) -> None:
 
         # One window, one H2OFrame round trip for the whole batch.
         frame = build_inference_frame(app.state.store, payload.grid_id, targets)
+        _observe_drift(app, frame)
         values = [float(v) for v in champion.predict(frame)]
 
         model_version = champion.version or "unknown"
