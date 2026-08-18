@@ -1,7 +1,7 @@
 .PHONY: setup lint test run-api dvc-init docker-up docker-down \
         airflow-up airflow-down airflow-logs airflow-reset dag-test pipeline-local \
         data-export data-import train \
-        seed-redis ampops-db-init forecast-trigger forecast-export
+        seed-redis ampops-db-init forecast-trigger load-actuals  forecast-export
 
 # Prefer repo .venv when present; otherwise use whatever `python` is active
 # (e.g. conda env ampops). Override with: make train PYTHON=/path/to/python
@@ -159,6 +159,9 @@ ampops-db-init:
 forecast-trigger:
 	docker compose exec airflow-scheduler \
 		airflow dags trigger ampops_daily_forecast
+
+load-actuals:
+	python scripts/load_actuals.py --date $${DATE:-2018-08-02}
 
 # Postgres lives in a named volume, so `make airflow-reset` (compose down -v)
 # destroys it. This CSV is the only host-side copy that survives one.
