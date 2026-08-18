@@ -1,3 +1,4 @@
+
 # AmpOps
 
 **An automated, reproducible short-term load forecasting platform for smart grid reliability.**
@@ -49,7 +50,7 @@ Upstream Raw Data Ingestion (PJM Grid + Open-Meteo Weather API)
 2. **AutoML & Experiment Tracking** — Airflow (or `make train`) runs an **H2O AutoML** search over algorithms and hyperparameters, logs the leader to MLflow, and scores it on a validation tail. Selection uses `nfolds=0` with an explicit `validation_frame` rather than k-fold, because k-fold would shuffle time-ordered rows and leak future information. Tracking can target **Databricks MLflow** or a local compose MLflow server. Requires Java — see Prerequisites.
 3. **Registry & Holdout** — Champion promotion to `models:/…@champion` (Databricks Unity Catalog when a catalog is configured; soft-fails to a `runs:/` URI otherwise so training still completes), followed by a post-registration evaluation against the sealed test set, tagged onto the registered version.
 4. **Serving** — FastAPI + H2O inference behind a Redis-backed forecast cache and feature store, orchestrated by a daily forecast DAG that precomputes the next operating day and persists to Postgres. Implemented and validated end-to-end in the local Docker stack — see [Serving](#serving) below.
-5. **Monitoring & Drift Detection** — Prometheus scrapes operational and drift metrics from FastAPI, while a custom PSI monitor evaluates a rolling 168-hour inference window across eight weather and load-history features. Grafana is provisioned with an AmpOps monitoring dashboard showing overall drift status and per-feature PSI. Controlled temperature and humidity corruption scenarios are provided for drift validation.
+5. **Monitoring & Drift Detection** — Prometheus scrapes operational and drift metrics from FastAPI, while a custom PSI monitor evaluates a rolling 168-hour inference window across eight weather and load-history features. Grafana is provisioned with two dashboards: `AmpOps Monitoring` for drift lifecycle state and per-feature PSI, and `AmpOps Forecast Performance` for actual-vs-predicted demand, MAE, and MAPE from persisted forecasts and delayed actuals. Controlled temperature and humidity corruption scenarios are provided for drift validation.
 
 Full Databricks wiring notes: [`docs/databricks_experiment_tracking.md`](docs/databricks_experiment_tracking.md). Full serving write-up: [`docs/fastapi_serving_layer.md`](docs/fastapi_serving_layer.md); binding serving spec: [`docs/serving_contract.md`](docs/serving_contract.md). System architecture with diagrams: [`docs/system_architecture.md`](docs/system_architecture.md).
 
@@ -60,10 +61,8 @@ AmpOps uses **Prometheus + Grafana** for operational monitoring and a custom
 
 ### Operational monitoring
 
-FastAPI exposes Prometheus metrics at `/metrics`, including request metrics and
-AmpOps-specific prediction, cache, and drift measurements. Prometheus scrapes
-the API every 15 seconds and Grafana is automatically provisioned with the
-Prometheus datasource and the `AmpOps Monitoring` dashboard.
+FastAPI exposes Prometheus metrics at `/metrics`, including request metrics and AmpOps-specific prediction, cache, and drift measurements. Prometheus scrapes the API every 15 seconds, and Grafana is automatically provisioned with both Prometheus and PostgreSQL datasources. The `AmpOps Monitoring` dashboard tracks drift lifecycle state (`WARMING UP`, `NORMAL`, `ALERT`) and per-feature PSI scores, while the `AmpOps Forecast Performance` dashboard joins persisted forecasts with delayed actual load in Postgres to visualize actual-vs-predicted demand and compute MAE and MAPE.
+
 
 | Piece | Status |
 |---|---|
@@ -71,10 +70,43 @@ Prometheus datasource and the `AmpOps Monitoring` dashboard.
 | Prometheus scrape (`api:8000/metrics`) | **Implemented** |
 | Grafana datasource provisioning | **Implemented** |
 | Grafana `AmpOps Monitoring` dashboard | **Implemented** |
+| Grafana `AmpOps Forecast Performance` dashboard | **Implemented** |
 | PSI input-drift detection | **Implemented** |
 | Controlled drift simulation | **Implemented** |
-| Actuals-vs-prediction monitoring | **Not yet implemented** |
-| Automatic retraining trigger | **Not yet implemented** |
+| Actuals-vs-prediction monitoring | **Implemented** |
+| Automatic retraining trigger | **Future production extension** |
+
+
+### Forecast performance monitoring
+
+Forecast performance is monitored separately from input drift because actual load
+becomes available only after a forecast has been issued. The daily forecast DAG
+persists predictions to Postgres, and delayed actuals are stored in a separate
+`actuals` table keyed by `grid_id` and `target_ts`.
+
+For reproducible validation, AmpOps uses a historical production replay from the
+sealed test set. After generating the 24 hourly forecasts for **2018-08-02**,
+the corresponding `COMED_MW` actuals are loaded with:
+
+```bash
+make load-actuals
+```
+
+The `AmpOps Forecast Performance` Grafana dashboard joins forecasts and actuals
+from Postgres and displays:
+
+* actual vs. predicted hourly demand
+* Mean Absolute Error (MAE)
+* Mean Absolute Percentage Error (MAPE)
+
+For the validated 24-hour replay, all **24 forecasts matched 24 actuals**, with:
+
+* **MAE: 812.72 MW**
+* **MAPE: 6.00%**
+
+This replay demonstrates post-prediction model-performance monitoring once ground
+truth becomes available; it is separate from the Prometheus/PSI input-drift path.
+
 
 ### Input-drift detection
 
@@ -187,9 +219,10 @@ for reproducible drift validation. Electricity demand and weather are strongly
 seasonal, so a long-running production deployment should use season-aware or
 context-matched reference distributions.
 
-The system currently detects **input/data drift** and operational anomalies.
-It does not yet compute live forecast error such as MAPE/MAE after actual load
-becomes available, and drift alerts do not automatically trigger retraining.
+Forecast-performance monitoring currently uses delayed actuals from a historical
+sealed-test replay rather than a continuously arriving production ground-truth
+feed. Automatic retraining from drift or performance alerts is left as a future
+production extension.
 
 ## Evaluation
 
@@ -335,6 +368,7 @@ make run-api            # host, no Redis/Docker needed (parquet feature-store ba
 make docker-up          # docker compose --profile serving up --build
 make seed-redis          # populate the Redis feature store (required once before /predict works)
 make forecast-trigger    # run the daily forecast DAG against the live API
+make load-actuals        # load delayed actuals for forecast-performance monitoring
 make forecast-export     # Postgres forecasts -> data/processed/forecasts.csv
 ```
 
@@ -370,24 +404,26 @@ ampops/
 │   ├── store.py                 # FeatureStore / ForecastCache (Redis + parquet/in-memory backends)
 │   ├── schemas.py               # request/response Pydantic models
 │   └── config.py                # env-driven Settings, not memoized
-monitoring/
-  prometheus.yml
-  drift.py
-  drift_baseline.json
-  grafana/
-    dashboards/
-      ampops-monitoring.json
-    provisioning/
-      dashboards/
-      datasources/
-
-scripts/
-  run_pipeline_local.py
-  run_training.py
-  seed_redis.py
-  build_drift_baseline.py
-  simulate_drift.py
-
+├── monitoring/
+│   ├── prometheus.yml
+│   ├── drift.py
+│   ├── drift_baseline.json
+│   └── grafana/
+│       ├── dashboards/
+│       │   ├── ampops-monitoring.json
+│       │   └── ampops-forecast-performance.json
+│       └── provisioning/
+│           ├── dashboards/
+│           └── datasources/
+│               ├── prometheus.yml
+│               └── postgres.yml
+├── scripts/
+│   ├── run_pipeline_local.py
+│   ├── run_training.py
+│   ├── seed_redis.py
+│   ├── build_drift_baseline.py
+│   ├── simulate_drift.py
+│   └── load_actuals.py
 ├── notebooks/                 # EDA
 ├── tests/
 ├── docs/

@@ -1,0 +1,17 @@
+apiVersion: 1
+
+datasources:
+  - name: AmpOps Postgres
+    uid: ampops-postgres
+    type: postgres
+    access: proxy
+    url: postgres:5432
+    user: airflow
+    secureJsonData:
+      password: airflow
+    jsonData:
+      database: ampops
+      sslmode: disable
+      postgresVersion: 1500
+      timescaledb: false
+    editable: true
